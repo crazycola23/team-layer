@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Reviewer Finding",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "findingId", "severity", "status", "candidateRevision", "requirement", "location", "evidence", "impact", "requiredOutcome"],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "findingId": {"type": "string", "minLength": 1},
+    "severity": {"enum": ["blocker", "major", "minor", "note"]},
+    "status": {"enum": ["open", "fixed", "verified", "closed", "rejected-with-evidence", "accepted-risk", "unresolved-product"]},
+    "candidateRevision": {"type": "string", "pattern": "^git:[0-9a-fA-F]{7,64}$"},
+    "requirement": {"type": "string", "minLength": 1},
+    "location": {"type": "string", "minLength": 1},
+    "evidence": {"type": "string", "minLength": 1},
+    "impact": {"type": "string", "minLength": 1},
+    "requiredOutcome": {"type": "string", "minLength": 1}
+  }
+}

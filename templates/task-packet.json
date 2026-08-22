@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "taskId": "task:example",
+  "sessionId": "feature:example",
+  "subject": "agent:fullstack-01",
+  "role": "fullstack",
+  "baseRevision": "git:0123456",
+  "readSet": ["src/**", "tests/**"],
+  "writeSet": ["src/**", "tests/**"],
+  "inputs": [
+    {
+      "id": "contract:example-api",
+      "revision": "sha256:replace-me",
+      "authority": "spec-suite"
+    }
+  ],
+  "acceptance": ["AC-1"],
+  "validation": ["npm test"]
+}

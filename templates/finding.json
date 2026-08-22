@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "findingId": "FIND-001",
+  "severity": "major",
+  "status": "open",
+  "candidateRevision": "git:replace-me",
+  "requirement": "AC-1",
+  "location": "src/example.ts:42",
+  "evidence": "Observed behavior or code/test evidence",
+  "impact": "Concrete user/system consequence",
+  "requiredOutcome": "What must be true to close this finding"
+}
