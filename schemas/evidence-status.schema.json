@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/crazycola23/team-layer/schemas/evidence-status.schema.json",
+  "title": "Validation evidence status",
+  "description": "What running a check concluded. `errored` is deliberately not `failed`: a missing binary or a timeout is nobody's evidence about the code, and collapsing the two sends the implementer to look for a bug that is not there.",
+  "x-generated-from": "src/validation.mjs EVIDENCE_STATUSES",
+  "type": "string",
+  "enum": [
+    "passed",
+    "failed",
+    "errored"
+  ]
+}

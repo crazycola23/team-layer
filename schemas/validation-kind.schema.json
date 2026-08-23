@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/crazycola23/team-layer/schemas/validation-kind.schema.json",
+  "title": "Validation check kind",
+  "description": "How a check is satisfied: by running something, or by somebody judging it. Both are semantic evidence about one candidate and both go stale the same way, which is why a gate can weigh them together (plan §6, §7).",
+  "x-generated-from": "src/validation.mjs VALIDATION_KINDS",
+  "type": "string",
+  "enum": [
+    "command",
+    "review"
+  ]
+}

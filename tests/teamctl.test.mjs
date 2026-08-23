@@ -143,7 +143,7 @@ test('doctor reports a healthy configured worktree', () => {
 /** A task packet for `session`, valid unless deliberately broken by the caller. */
 function taskPacket(overrides = {}) {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     taskId: 'task:coupon-api',
     sessionId: 'feature:coupon',
     subject: 'agent:fullstack-01',
@@ -153,7 +153,9 @@ function taskPacket(overrides = {}) {
     writeSet: ['src/coupon/**'],
     inputs: [{ id: 'contract:coupon', revision: `sha256:${'1'.repeat(64)}`, authority: 'product-architect' }],
     acceptance: ['AC-1 discount applies at most once'],
-    validation: ['npm test'],
+    validationPlan: [
+      { checkId: 'unit-tests', kind: 'command', requiredAt: ['handoff', 'merge'], command: 'npm test' },
+    ],
     ...overrides,
   };
 }
@@ -545,7 +547,6 @@ test('a review crosses worktrees and its applicability follows the candidate', (
     sessionId: 'feature:coupon', taskId: 'task:coupon-api', status: 'approved',
     candidateRevision: head, requirementsRevision: `sha256:${'1'.repeat(64)}`,
     summary: 'AC-1 holds; the discount is applied in the domain layer.',
-    validationEvidence: ['npm test'],
   }, 'review.json');
   const recorded = JSON.parse(run(['review', 'record', '--review', 'review.json'], g).stdout);
   assert.equal(recorded.reviewId, 'review:coupon-api-1');
@@ -669,3 +670,195 @@ test('the shipped review template records with only its ids filled in', () => {
   assert.equal(JSON.parse(run(['review', 'state', '--session', shipped.sessionId,
     '--task', shipped.taskId, '--candidate', template.candidateRevision], g).stdout).unresolvedFindings, 1);
 });
+
+/** A check the fixture can actually run, without a package.json or a network. */
+function nodeCheck(script) {
+  return `"${process.execPath}" -e "${script}"`;
+}
+
+function validationPacket(overrides = {}) {
+  return taskPacket({
+    validationPlan: [
+      {
+        checkId: 'unit-tests', kind: 'command', requiredAt: ['handoff', 'merge'],
+        command: nodeCheck(`console.log('unit tests green')`),
+      },
+      {
+        checkId: 'contract-tests', kind: 'command', requiredAt: ['merge'],
+        command: nodeCheck(`console.error('AC-1 regressed'); process.exit(1)`),
+      },
+      { checkId: 'peer-review', kind: 'review', requiredAt: ['merge'], role: 'reviewer' },
+    ],
+    ...overrides,
+  });
+}
+
+/**
+ * The whole point of a validation plan, end to end (plan §6, §7).
+ *
+ * What this is really testing is that a gate's answer is derived from records and the
+ * current candidate every single time, and so cannot be stale — only unknown. The
+ * three-valued answer is the load-bearing part: after a commit the failing check stops
+ * reading as failed, because nothing has been run against what the caller now has.
+ */
+test('validate run records evidence, and the gate answer follows the candidate', () => {
+  const f = bootstrapped({ agentId: 'fullstack-01', role: 'fullstack' });
+  run(['session', 'start', '--session', 'feature:coupon', '--target', 'main'], f);
+  writePacket(f, validationPacket());
+  run(['task', 'issue', '--packet', 'packet.json'], f);
+  const args = ['--session', 'feature:coupon', '--task', 'task:coupon-api'];
+
+  // Before anything runs, the gate is unknown rather than failed: nobody has claimed
+  // the suite is broken, only that nobody has looked.
+  const cold = JSON.parse(run(['validate', 'state', ...args, '--gate', 'handoff'], f).stdout);
+  assert.deepEqual([cold.status, cold.required, cold.unknown], ['unknown', 1, 1]);
+  assert.deepEqual(cold.checks[0].reasons, ['no-evidence']);
+
+  // The handoff gate asks for one check, so running the gate runs one check — the
+  // merge-only contract suite is not the implementer's toll to pay here.
+  const handoffRun = JSON.parse(run(['validate', 'run', ...args, '--gate', 'handoff'], f).stdout);
+  assert.deepEqual([handoffRun.ran, handoffRun.awaitingReview], [1, []]);
+  const first = handoffRun.evidence[0];
+  assert.deepEqual([first.evidenceId, first.checkId, first.status, first.exitCode],
+    ['evidence:unit-tests-1', 'unit-tests', 'passed', 0]);
+  assert.match(first.outputExcerpt, /unit tests green/, 'the record keeps what it saw, not just a verdict');
+  assert.ok(first.recordDigest.startsWith('sha256:'));
+  assert.equal(JSON.parse(run(['validate', 'state', ...args, '--gate', 'handoff'], f).stdout).status, 'passed');
+
+  // The same evidence counts toward merge — a check required at two gates is one check,
+  // not two — but merge asks for more, and the rest is still unmeasured.
+  const beforeMerge = JSON.parse(run(['validate', 'state', ...args, '--gate', 'merge'], f).stdout);
+  assert.deepEqual([beforeMerge.status, beforeMerge.required, beforeMerge.passed, beforeMerge.unknown],
+    ['unknown', 3, 1, 2]);
+
+  const mergeRun = JSON.parse(run(['validate', 'run', ...args, '--gate', 'merge'], f).stdout);
+  // The review check is reported, not run and not dropped: `validate run` covering a
+  // gate it cannot finish would read as if it had.
+  assert.deepEqual(mergeRun.awaitingReview, [{ checkId: 'peer-review', role: 'reviewer' }]);
+  // Sequence numbers are per session, not per check, so two ids can never collide even
+  // when the same check is rerun.
+  assert.deepEqual(mergeRun.evidence.map((e) => [e.evidenceId, e.status]),
+    [['evidence:unit-tests-2', 'passed'], ['evidence:contract-tests-3', 'failed']]);
+
+  const failing = JSON.parse(run(['validate', 'state', ...args, '--gate', 'merge'], f).stdout);
+  assert.deepEqual([failing.status, failing.failed], ['failed', 1]);
+
+  assert.deepEqual(JSON.parse(run(['validate', 'show', '--session', 'feature:coupon'], f).stdout)
+    .map((e) => e.evidenceId),
+  ['evidence:unit-tests-1', 'evidence:unit-tests-2', 'evidence:contract-tests-3']);
+  assert.equal(JSON.parse(run(['validate', 'show', '--session', 'feature:coupon',
+    '--check', 'unit-tests'], f).stdout).length, 2);
+  assert.equal(JSON.parse(run(['validate', 'show', '--session', 'feature:coupon',
+    '--evidence', 'evidence:unit-tests-1'], f).stdout).recordDigest, first.recordDigest);
+
+  // A reviewer approves the work and cites the run it read. The gate still refuses,
+  // because a human approval does not overrule a failing check — and that is the
+  // separation the two check kinds exist for.
+  const linked = path.join(f.dir, 'wt-reviewer');
+  git(['worktree', 'add', linked, '-b', 'review'], f.repo);
+  const g = { dir: f.dir, repo: linked, home: f.home };
+  run(['setup', '--agent-id', 'reviewer-01', '--role', 'reviewer', '--harness', 'codex', '--repo', linked], g);
+  const head = `git:${git(['rev-parse', 'HEAD'], f.repo)}`;
+  writeDraft(g, {
+    sessionId: 'feature:coupon', taskId: 'task:coupon-api', status: 'approved',
+    candidateRevision: head, requirementsRevision: `sha256:${'1'.repeat(64)}`,
+    summary: 'AC-1 holds in the domain layer; the contract suite failure is pre-existing.',
+    validationEvidence: ['evidence:unit-tests-2'],
+  }, 'review.json');
+  run(['review', 'record', '--review', 'review.json'], g);
+  const approved = JSON.parse(run(['validate', 'state', ...args, '--gate', 'merge'], f).stdout);
+  assert.deepEqual([approved.status, approved.passed, approved.failed], ['failed', 2, 1]);
+
+  // Then the implementer commits. Every answer above described a candidate that no
+  // longer exists, so the gate goes quiet rather than confident: the failure is not
+  // reported as fixed, and the approval is not reported as still standing.
+  fs.writeFileSync(path.join(f.repo, 'coupon.md'), '# coupon\n');
+  git(['add', 'coupon.md'], f.repo);
+  git(['commit', '-m', 'coupon domain rule'], f.repo);
+  const moved = JSON.parse(run(['validate', 'state', ...args, '--gate', 'merge'], f).stdout);
+  assert.deepEqual([moved.status, moved.unknown, moved.failed], ['unknown', 3, 0]);
+  assert.deepEqual(moved.checks.map((c) => c.reasons),
+    [['candidate-moved'], ['candidate-moved'], ['candidate-moved']]);
+
+  const events = JSON.parse(run(['session', 'events', '--session', 'feature:coupon'], f).stdout);
+  assert.deepEqual(events.filter((e) => e.kind === 'evidence-recorded')
+    .map((e) => [e.checkId, e.status, e.actor]), [
+    ['unit-tests', 'passed', 'agent:fullstack-01'],
+    ['unit-tests', 'passed', 'agent:fullstack-01'],
+    ['contract-tests', 'failed', 'agent:fullstack-01'],
+  ]);
+});
+
+/**
+ * The refusals that keep evidence and citations honest.
+ *
+ * All 3 rather than 4: none of them get better by being retried unchanged. The dirty
+ * worktree is the interesting one — it is the only refusal in this CLI that is about
+ * the working copy rather than the ledger, and it exists because evidence names the
+ * commit it is evidence about.
+ */
+test('the CLI refuses evidence and citations that would misdescribe what ran', () => {
+  const f = bootstrapped({ agentId: 'fullstack-01', role: 'fullstack' });
+  run(['session', 'start', '--session', 'feature:coupon', '--target', 'main'], f);
+  writePacket(f, validationPacket());
+  run(['task', 'issue', '--packet', 'packet.json'], f);
+  const args = ['--session', 'feature:coupon', '--task', 'task:coupon-api'];
+
+  // A modified tracked file means the suite ran against something no commit contains,
+  // and there is no flag to record it anyway: a knowingly-wrong candidate is worse
+  // than no record, because it is indistinguishable from a real one afterwards.
+  fs.writeFileSync(path.join(f.repo, 'README.md'), '# fixture\nedited\n');
+  const dirty = refusal(['validate', 'run', ...args, '--gate', 'handoff'], f);
+  assert.deepEqual(dirty, { code: 'WORKTREE_DIRTY', exit: 3 });
+  assert.deepEqual(JSON.parse(run(['validate', 'show', '--session', 'feature:coupon'], f).stdout), [],
+    'a refused run records nothing, so the next real run is still seq 1');
+  git(['commit', '-am', 'edit readme'], f.repo);
+  assert.equal(JSON.parse(run(['validate', 'run', ...args, '--gate', 'handoff'], f).stdout).ran, 1);
+
+  // An untracked scratch file is not a candidate change; packet.json itself is one, so
+  // the run above already proves it, and this makes the intent explicit.
+  fs.writeFileSync(path.join(f.repo, 'notes.txt'), 'scratch\n');
+  assert.equal(JSON.parse(run(['validate', 'run', ...args, '--check', 'unit-tests'], f).stdout).ran, 1);
+
+  assert.deepEqual(refusal(['validate', 'state', ...args, '--gate', 'ship-it'], f),
+    { code: 'UNKNOWN_VALIDATION_GATE', exit: 3 });
+  // A check the packet never declared is a typo in the invocation, not a refusal by the
+  // ledger: nothing was asked of it, so it exits 1 and says what the packet does declare.
+  const unknown = run(['validate', 'run', ...args, '--check', 'lint'], f, 1);
+  assert.match(unknown.stderr, /declares no check "lint".*unit-tests, contract-tests, peer-review/s);
+  // Evidence cannot answer a review check: that judgement lives in one place.
+  assert.deepEqual(refusal(['validate', 'run', ...args, '--check', 'peer-review'], f), null,
+    'selecting a review check runs nothing rather than refusing');
+
+  const linked = path.join(f.dir, 'wt-reviewer');
+  git(['worktree', 'add', linked, '-b', 'review'], f.repo);
+  const g = { dir: f.dir, repo: linked, home: f.home };
+  run(['setup', '--agent-id', 'reviewer-01', '--role', 'reviewer', '--harness', 'codex', '--repo', linked], g);
+  const head = `git:${git(['rev-parse', 'HEAD'], f.repo)}`;
+  const base = {
+    sessionId: 'feature:coupon', taskId: 'task:coupon-api', status: 'approved',
+    candidateRevision: head, requirementsRevision: `sha256:${'1'.repeat(64)}`,
+    summary: 'AC-1 holds.',
+  };
+  for (const [name, cited, expected] of [
+    ['a citation nobody can resolve', ['evidence:unit-tests-99'], 'REVIEW_EVIDENCE_UNKNOWN'],
+    ['a citation that is not an id at all', ['npm test'], 'REVIEW_EVIDENCE_UNKNOWN'],
+    ['the same run cited twice', ['evidence:unit-tests-1', 'evidence:unit-tests-1'], 'MALFORMED_REVIEW'],
+  ]) {
+    writeDraft(g, { ...base, validationEvidence: cited }, 'review.json');
+    assert.deepEqual(refusal(['review', 'record', '--review', 'review.json'], g),
+      { code: expected, exit: 3 }, name);
+  }
+
+  // The citation resolves, but it is about the commit before this one. Left standing it
+  // would be the most convincing kind of false confidence: a real record, correctly
+  // sealed, describing something else (plan §17 Scenario 5).
+  fs.writeFileSync(path.join(f.repo, 'coupon.md'), '# coupon\n');
+  git(['add', 'coupon.md'], f.repo);
+  git(['commit', '-m', 'coupon domain rule'], f.repo);
+  const moved = `git:${git(['rev-parse', 'HEAD'], f.repo)}`;
+  writeDraft(g, { ...base, candidateRevision: moved, validationEvidence: ['evidence:unit-tests-1'] }, 'review.json');
+  assert.deepEqual(refusal(['review', 'record', '--review', 'review.json'], g),
+    { code: 'REVIEW_EVIDENCE_MISMATCH', exit: 3 });
+});
+

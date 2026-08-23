@@ -16,6 +16,7 @@ const SESSION_SCHEMA = loadSchema(path.join(ROOT, 'schemas', 'session.schema.jso
 const TASK_SCHEMA = loadSchema(path.join(ROOT, 'schemas', 'task-record.schema.json'));
 const HANDOFF_SCHEMA = loadSchema(path.join(ROOT, 'schemas', 'handoff.schema.json'));
 const REVIEW_SCHEMA = loadSchema(path.join(ROOT, 'schemas', 'review-decision.schema.json'));
+const EVIDENCE_SCHEMA = loadSchema(path.join(ROOT, 'schemas', 'validation-evidence.schema.json'));
 
 function tempCommonDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'team-layer-ledger-'));
@@ -53,7 +54,7 @@ function deadPid() {
 
 function packet(overrides = {}) {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     taskId: 'task:coupon',
     subject: 'agent:fullstack-01',
     role: 'fullstack',
@@ -62,7 +63,9 @@ function packet(overrides = {}) {
     writeSet: ['src/**'],
     inputs: [{ id: 'contract:coupon', revision: `sha256:${'1'.repeat(64)}`, authority: 'product-architect' }],
     acceptance: ['AC-1'],
-    validation: ['npm test'],
+    validationPlan: [
+      { checkId: 'unit-tests', kind: 'command', requiredAt: ['handoff', 'merge'], command: 'npm test' },
+    ],
     ...overrides,
   };
 }
@@ -900,7 +903,13 @@ test('a review draft cannot assign what the ledger owns, or misspell what it doe
   // a decision whose content is silently missing — and the digest would certify it.
   assert.equal(record({ finding: [finding()] }), 'MALFORMED_REVIEW');
   assert.equal(record({ summary: '   ' }), 'MALFORMED_REVIEW');
-  assert.equal(record({ validationEvidence: ['npm test', ''] }), 'MALFORMED_REVIEW');
+  assert.equal(record({ validationEvidence: ['evidence:unit-tests-1', ''] }), 'MALFORMED_REVIEW');
+  assert.equal(record({ validationEvidence: ['evidence:a-1', 'evidence:a-1'] }), 'MALFORMED_REVIEW');
+  // A citation nobody can follow is decoration. `npm test` was the v1 shape and is
+  // not even id-shaped, so it must come back as unfollowable evidence rather than as
+  // a lexical complaint about slugs — the reviewer needs to know what to record.
+  assert.equal(record({ validationEvidence: ['npm test'] }), 'REVIEW_EVIDENCE_UNKNOWN');
+  assert.equal(record({ validationEvidence: ['evidence:unit-tests-1'] }), 'REVIEW_EVIDENCE_UNKNOWN');
   assert.equal(record({ findings: [finding({ severity: 'critical' })] }), 'MALFORMED_REVIEW');
   assert.equal(record({ findings: [finding({ status: 'wontfix' })] }), 'MALFORMED_REVIEW');
   assert.equal(record({ status: 'lgtm' }), 'UNKNOWN_REVIEW_STATUS');
@@ -1043,3 +1052,321 @@ test('the shipped review template records against the shipped task packet', () =
   assert.deepEqual(validate(REVIEW_SCHEMA, record), []);
   assert.equal(record.decision.status, 'approved');
 });
+
+// -------------------------------------------------------------------- validation
+
+/** A result in the shape `runCommandCheck` returns, without running anything. */
+function result(overrides = {}) {
+  return {
+    status: 'passed',
+    exitCode: 0,
+    durationMs: 1234,
+    resultDigest: `sha256:${'a'.repeat(64)}`,
+    outputExcerpt: '42 tests, 0 failures\n',
+    outputTruncated: false,
+    ...overrides,
+  };
+}
+
+function evidence(ledger, sessionId, over = {}) {
+  return ledger.recordEvidence({
+    sessionId,
+    taskId: 'task:coupon',
+    checkId: 'unit-tests',
+    candidateRevision: 'git:def5678',
+    result: result(),
+    ...over,
+  });
+}
+
+/** A plan with one check of each kind, so both gate paths are exercisable. */
+function mixedPacket(overrides = {}) {
+  return packet({
+    validationPlan: [
+      { checkId: 'unit-tests', kind: 'command', requiredAt: ['handoff', 'merge'], command: 'npm test' },
+      { checkId: 'peer-review', kind: 'review', requiredAt: ['merge'], role: 'reviewer' },
+    ],
+    ...overrides,
+  });
+}
+
+test('a recorded evidence record is schema-valid and the ledger owns its identity', () => {
+  const { ledger, sessionId } = taskedSession();
+  const record = evidence(ledger, sessionId);
+
+  assert.deepEqual(validate(EVIDENCE_SCHEMA, record), []);
+  assert.deepEqual([record.evidenceId, record.seq], ['evidence:unit-tests-1', 1]);
+  assert.equal(record.recordedBy, 'test');
+  // The snapshot is copied from the task, like a handoff's and a review's: evidence
+  // that could name its own snapshot could claim to be about truth it never saw.
+  assert.equal(record.inputSnapshotDigest, ledger.readTask(sessionId, 'task:coupon').inputSnapshotDigest);
+
+  const event = ledger.readEvents(sessionId).find((e) => e.kind === 'evidence-recorded');
+  assert.deepEqual([event.evidenceId, event.checkId, event.status], ['evidence:unit-tests-1', 'unit-tests', 'passed']);
+
+  // Recording evidence is an input to a gate, not the gate: it moves nothing.
+  assert.equal(ledger.readTask(sessionId, 'task:coupon').state.status, 'issued');
+  assert.equal(ledger.readSession(sessionId).status, 'forming');
+});
+
+/**
+ * The seal covers the whole record, `seq` and `recordedAt` included.
+ *
+ * Deliberately unlike a review, whose digest covers only the judgement so that the same
+ * judgement hashes identically twice. Nothing here needs that: two runs of one suite are
+ * two observations, and a gate *reads* `status`, so a flippable one is a forgeable pass.
+ */
+test('an edited evidence record is refused on read rather than silently believed', () => {
+  const { ledger, sessionId } = taskedSession();
+  const record = evidence(ledger, sessionId, { result: result({ status: 'failed', exitCode: 1 }) });
+  const file = ledger.evidenceFile(sessionId, record.evidenceId);
+
+  assert.equal(ledger.readEvidence(sessionId, record.evidenceId).status, 'failed');
+  const stored = JSON.parse(fs.readFileSync(file, 'utf8'));
+  fs.writeFileSync(file, JSON.stringify({ ...stored, status: 'passed' }));
+  assert.equal(code(() => ledger.readEvidence(sessionId, record.evidenceId)), 'EVIDENCE_TAMPERED');
+
+  // Not just the verdict: rewriting when it happened, to make an old run look current,
+  // is the same attack with a different field.
+  fs.writeFileSync(file, JSON.stringify({ ...stored, recordedAt: '2030-01-01T00:00:00.000Z' }));
+  assert.equal(code(() => ledger.readEvidence(sessionId, record.evidenceId)), 'EVIDENCE_TAMPERED');
+});
+
+/**
+ * A packet whose plan cannot be run is refused at freeze, before anything depends on it.
+ *
+ * The plan is inside the frozen half of the packet, so this is the only moment the
+ * ledger can say no: afterwards the unrunnable check is part of an immutable record that
+ * some gate is required to consult.
+ */
+test('a task whose validation plan could not be run is refused at issue', () => {
+  const { ledger, sessionId } = startedSession();
+  for (const [name, plan] of [
+    ['no plan at all', undefined],
+    ['an empty plan', []],
+    ['a command check with nothing to run', [{ checkId: 'unit-tests', kind: 'command', requiredAt: ['merge'] }]],
+    ['a gate nobody consults', [{ checkId: 'unit-tests', kind: 'command', requiredAt: ['vibe-check'], command: 'npm test' }]],
+    ['a review check naming a role nobody has', [{ checkId: 'peer', kind: 'review', requiredAt: ['merge'], role: 'vibe-officer' }]],
+  ]) {
+    assert.equal(code(() => ledger.issueTask({ sessionId, packet: packet({ validationPlan: plan }) })),
+      'MALFORMED_TASK', name);
+  }
+
+  // v1's `validation: string[]` is refused by name rather than tolerated alongside the
+  // plan. Two answers to "how is this shown to be done" is worse than one wrong one:
+  // whichever the reader believes, half the toolchain consults the other.
+  const legacy = packet({ schemaVersion: 1, validation: ['npm test'] });
+  delete legacy.validationPlan;
+  const refused = () => ledger.issueTask({ sessionId, packet: legacy });
+  assert.equal(code(refused), 'MALFORMED_TASK');
+  assert.throws(refused, /validationPlan/, 'the refusal has to say what to write instead');
+  assert.deepEqual(ledger.listTasks(sessionId), []);
+});
+
+test('evidence must answer a check the packet actually declares, of a kind it can answer', () => {
+  const { ledger, sessionId } = startedSession();
+  ledger.issueTask({ sessionId, packet: mixedPacket() });
+
+  // A check nobody asked for reads in `listEvidence` exactly like a required one, and
+  // no gate would ever notice the difference.
+  assert.equal(code(() => evidence(ledger, sessionId, { checkId: 'lint' })), 'EVIDENCE_CHECK_UNKNOWN');
+  // A human judgement recorded as machine output would put the same fact in two places,
+  // and the two would disagree the first time one of them was rerun.
+  assert.equal(code(() => evidence(ledger, sessionId, { checkId: 'peer-review' })), 'EVIDENCE_KIND_MISMATCH');
+
+  for (const [name, bad, expected] of [
+    ['no result', { result: undefined }, 'MALFORMED_EVIDENCE'],
+    ['a verdict the vocabulary lacks', { result: result({ status: 'green' }) }, 'UNKNOWN_EVIDENCE_STATUS'],
+    ['a conclusion with no output behind it', { result: result({ resultDigest: '' }) }, 'MALFORMED_EVIDENCE'],
+    ['a negative duration', { result: result({ durationMs: -1 }) }, 'MALFORMED_EVIDENCE'],
+    ['a non-integer exit code', { result: result({ exitCode: 'ok' }) }, 'MALFORMED_EVIDENCE'],
+  ]) {
+    assert.equal(code(() => evidence(ledger, sessionId, bad)), expected, name);
+  }
+  assert.deepEqual(ledger.listEvidence(sessionId), [], 'nothing refused was written');
+
+  // A check that never exited has no exit code, and null is how it says so rather than
+  // 0 — which would be indistinguishable from success.
+  assert.equal(evidence(ledger, sessionId, {
+    result: result({ status: 'errored', exitCode: null, note: 'the check did not finish within 250ms' }),
+  }).exitCode, null);
+});
+
+/**
+ * Staleness refused at record time, the same way a review's is (plan §17 Scenario 2).
+ *
+ * A long suite is exactly where this bites: the task is restated while it runs, and the
+ * result that arrives afterwards describes inputs that are no longer the task's. Passing
+ * the snapshot read before the run is what turns that into a refusal instead of a
+ * credited pass.
+ */
+test('evidence run against inputs the task has moved past is refused', () => {
+  const { ledger, sessionId } = taskedSession();
+  const stale = ledger.readTask(sessionId, 'task:coupon').inputSnapshotDigest;
+  assert.equal(code(() => evidence(ledger, sessionId, { inputSnapshotDigest: stale })), null);
+
+  ledger.reissueTask({
+    sessionId, reason: 'coupon contract v2',
+    packet: packet({ inputs: [{ id: 'contract:coupon', revision: `sha256:${'9'.repeat(64)}`, authority: 'product-architect' }] }),
+  });
+  assert.equal(code(() => evidence(ledger, sessionId, { inputSnapshotDigest: stale })), 'EVIDENCE_STALE');
+  assert.equal(ledger.listEvidence(sessionId).length, 1);
+
+  // Declaring it stays optional, because the ledger copies the current snapshot anyway.
+  // What the declaration buys is the refusal above.
+  assert.equal(code(() => evidence(ledger, sessionId)), null);
+});
+
+test('evidence is listable by task and by check, in the order it was recorded', () => {
+  const { ledger, sessionId } = startedSession();
+  ledger.issueTask({ sessionId, packet: mixedPacket() });
+  ledger.issueTask({ sessionId, packet: mixedPacket({ taskId: 'task:refund' }) });
+  evidence(ledger, sessionId);
+  evidence(ledger, sessionId, { result: result({ status: 'failed', exitCode: 1 }) });
+  evidence(ledger, sessionId, { taskId: 'task:refund' });
+
+  // The sequence is per session, so two checks can never produce one id — and the ids
+  // stay sortable into the order the runs actually happened in.
+  assert.deepEqual(ledger.listEvidence(sessionId).map((e) => e.evidenceId),
+    ['evidence:unit-tests-1', 'evidence:unit-tests-2', 'evidence:unit-tests-3']);
+  assert.deepEqual(ledger.listEvidence(sessionId, { taskId: 'task:refund' }).map((e) => e.seq), [3]);
+  assert.deepEqual(ledger.listEvidence(sessionId, { checkId: 'lint' }), []);
+  assert.equal(code(() => ledger.readEvidence(sessionId, 'evidence:unit-tests-9')), 'NOT_FOUND');
+});
+
+/**
+ * A gate's answer is derived on every call, so it can never be stale — only unknown.
+ *
+ * Three-valued because two values force a lie. Evidence that describes a candidate the
+ * work has moved past is not a failure (it sends the implementer to fix passing code)
+ * and not a pass (it merges something nothing ran against).
+ */
+test('a gate is answered from the records and the candidate, and never stored', () => {
+  const { ledger, sessionId } = startedSession();
+  ledger.issueTask({ sessionId, packet: mixedPacket() });
+  const at = (gate, over = {}) => ledger.validationStateFor(sessionId, 'task:coupon',
+    { gate, candidateRevision: 'git:def5678', ...over });
+
+  const cold = at('handoff');
+  assert.deepEqual([cold.status, cold.required, cold.unknown], ['unknown', 1, 1]);
+  assert.deepEqual(cold.checks[0].reasons, ['no-evidence']);
+
+  evidence(ledger, sessionId);
+  assert.equal(at('handoff').status, 'passed');
+  // One check required at two gates is one check: the same record answers both.
+  assert.deepEqual([at('merge').status, at('merge').passed, at('merge').unknown], ['unknown', 1, 1]);
+  // A gate this task asks nothing of is passed, with the reason attached so a caller
+  // printing it says "nothing is required here" rather than implying it verified something.
+  assert.deepEqual([at('integration').status, at('integration').reasons], ['passed', ['no-checks-required']]);
+  assert.equal(code(() => at('ship-it')), 'UNKNOWN_VALIDATION_GATE');
+
+  // A newer run supersedes an older one for the same check, in both directions.
+  evidence(ledger, sessionId, { result: result({ status: 'failed', exitCode: 1 }) });
+  assert.deepEqual([at('handoff').status, at('handoff').checks[0].runs], ['failed', 2]);
+  evidence(ledger, sessionId);
+  assert.equal(at('handoff').status, 'passed');
+
+  // Then the candidate moves. The pass does not survive it, and neither does the
+  // failure: what is known is that nothing has been run against this.
+  const moved = at('handoff', { candidateRevision: 'git:9999999' });
+  assert.deepEqual([moved.status, moved.checks[0].reasons], ['unknown', ['candidate-moved']]);
+  assert.equal(moved.checks[0].observed.candidateRevision, 'git:def5678',
+    'the answer says which candidate it is about, so the caller can see the gap');
+  // And asking without naming a candidate is answered as unknown rather than assumed.
+  assert.deepEqual(at('handoff', { candidateRevision: null }).checks[0].reasons, ['candidate-unknown']);
+
+  // An errored run is unknown, not failed: it says nothing about the candidate, so the
+  // next action is to fix the runner rather than the code.
+  evidence(ledger, sessionId, { result: result({ status: 'errored', exitCode: null, note: 'runner died' }) });
+  const errored = at('handoff');
+  assert.deepEqual([errored.status, errored.checks[0].reasons], ['unknown', ['errored']]);
+});
+
+test('a review check at a gate is answered by the review ledger, not by evidence', () => {
+  const { ledger, sessionId } = startedSession();
+  ledger.issueTask({ sessionId, packet: mixedPacket() });
+  const merge = () => ledger.validationStateFor(sessionId, 'task:coupon',
+    { gate: 'merge', candidateRevision: 'git:def5678' });
+  evidence(ledger, sessionId);
+
+  const before = merge().checks.find((c) => c.checkId === 'peer-review');
+  assert.deepEqual([before.status, before.reasons], ['unknown', ['no-review']]);
+
+  review(ledger, sessionId, decision());
+  assert.deepEqual([merge().status, merge().passed], ['passed', 2]);
+
+  // A changes-requested decision is a failure of the check, not an absence of one.
+  review(ledger, sessionId, decision({
+    status: 'changes-requested', requirementsRevision: undefined, findings: [finding()],
+  }));
+  assert.equal(merge().status, 'failed');
+
+  // An approval from the wrong capacity does not satisfy a check that named a role.
+  // Unknown rather than failed: somebody did approve this, and what is missing is the
+  // required reviewer's answer rather than a verdict against the work.
+  const { ledger: other, sessionId: otherSession } = startedSession();
+  other.issueTask({ sessionId: otherSession, packet: mixedPacket() });
+  review(other, otherSession, decision(), { actorRole: 'product-architect' });
+  const wrongRole = other.validationStateFor(otherSession, 'task:coupon',
+    { gate: 'merge', candidateRevision: 'git:def5678' }).checks.find((c) => c.checkId === 'peer-review');
+  assert.deepEqual([wrongRole.status, wrongRole.reasons], ['unknown', ['role-mismatch']]);
+});
+
+/**
+ * A failing check settles the gate even while other checks are unmeasured.
+ *
+ * The other order would be worse: reporting `unknown` because something else has not
+ * run yet hides a definite failure behind a shrug, and the caller retries instead of
+ * fixing it.
+ */
+test('a definite failure outranks an unmeasured check at the same gate', () => {
+  const { ledger, sessionId } = startedSession();
+  ledger.issueTask({ sessionId, packet: mixedPacket() });
+  evidence(ledger, sessionId, { result: result({ status: 'failed', exitCode: 1 }) });
+  const state = ledger.validationStateFor(sessionId, 'task:coupon',
+    { gate: 'merge', candidateRevision: 'git:def5678' });
+  assert.deepEqual([state.status, state.failed, state.unknown], ['failed', 1, 1]);
+});
+
+/**
+ * A citation has to resolve, or an approval's evidence is decoration.
+ *
+ * The mismatch case is the one worth having: a real record, correctly sealed, about a
+ * different candidate is the most convincing kind of false confidence there is.
+ */
+test('a review may only cite evidence from this task and this candidate', () => {
+  const { ledger, sessionId } = startedSession();
+  ledger.issueTask({ sessionId, packet: mixedPacket() });
+  ledger.issueTask({ sessionId, packet: mixedPacket({ taskId: 'task:refund' }) });
+  evidence(ledger, sessionId);
+  evidence(ledger, sessionId, { taskId: 'task:refund' });
+
+  assert.equal(code(() => review(ledger, sessionId,
+    decision({ validationEvidence: ['evidence:unit-tests-1'] }))), null);
+  for (const [name, cited, expected] of [
+    ['a citation nobody can resolve', ['evidence:unit-tests-9'], 'REVIEW_EVIDENCE_UNKNOWN'],
+    ['a citation that is not an id', ['npm test'], 'REVIEW_EVIDENCE_UNKNOWN'],
+    ['evidence belonging to another task', ['evidence:unit-tests-2'], 'REVIEW_EVIDENCE_UNKNOWN'],
+    ['the same run cited twice', ['evidence:unit-tests-1', 'evidence:unit-tests-1'], 'MALFORMED_REVIEW'],
+    ['an empty citation', [''], 'MALFORMED_REVIEW'],
+  ]) {
+    assert.equal(code(() => review(ledger, sessionId, decision({ validationEvidence: cited }))), expected, name);
+  }
+
+  // Same task, same session, real record — about the commit before this one.
+  assert.equal(code(() => review(ledger, sessionId, decision({
+    candidateRevision: 'git:9999999', validationEvidence: ['evidence:unit-tests-1'],
+  }))), 'REVIEW_EVIDENCE_MISMATCH');
+});
+
+test('the shipped task packet declares a plan both gates can be asked about', () => {
+  const shipped = JSON.parse(fs.readFileSync(path.join(ROOT, 'templates', 'task-packet.json'), 'utf8'));
+  const { ledger, sessionId } = startedSession({ sessionId: shipped.sessionId });
+  ledger.issueTask({ sessionId, packet: shipped });
+  for (const gate of ['handoff', 'merge']) {
+    const state = ledger.validationStateFor(sessionId, shipped.taskId, { gate, candidateRevision: 'git:def5678' });
+    assert.equal(state.status, 'unknown', `${gate} must be answerable and honest before anything runs`);
+    assert.ok(state.required >= 1, `${gate} must actually ask for something`);
+  }
+});
+

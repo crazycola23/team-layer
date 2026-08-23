@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "taskId": "task:example",
   "sessionId": "feature:example",
   "subject": "agent:fullstack-01",
@@ -23,7 +23,25 @@
   "acceptance": [
     "AC-1"
   ],
-  "validation": [
-    "npm test"
+  "validationPlan": [
+    {
+      "checkId": "unit-tests",
+      "kind": "command",
+      "requiredAt": [
+        "handoff",
+        "merge"
+      ],
+      "command": "npm test",
+      "description": "The suite must be green before this leaves the implementer's hands and again before it merges."
+    },
+    {
+      "checkId": "peer-review",
+      "kind": "review",
+      "requiredAt": [
+        "merge"
+      ],
+      "role": "reviewer",
+      "description": "Somebody other than the implementer has to have approved this exact candidate."
+    }
   ]
 }

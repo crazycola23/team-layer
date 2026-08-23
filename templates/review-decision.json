@@ -1,5 +1,5 @@
 {
-  "$comment": "A review draft: what you write, before `teamctl review record --review <this>` turns it into a decision. The ledger fills in reviewId, seq, reviewer, inputSnapshotDigest, recordedAt, recordedBy and decisionDigest; setting any of them here is refused rather than overridden. inputSnapshotDigest in particular is copied from the task, so a decision cannot claim to have been made against a snapshot it was not. Approving requires requirementsRevision, and it must name one of the task's declared inputs: an approval anchored to a revision the task never depended on could never go stale when the real requirement moved. The findings below include an open `minor`; only an unresolved `blocker` refuses an approval, because forcing the reviewer to choose between blocking and downgrading produces blockers relabelled as minors. See schemas/review-decision.schema.json for the stored shape and protocol/review.md for how a decision is consumed.",
+  "$comment": "A review draft: what you write, before `teamctl review record --review <this>` turns it into a decision. The ledger fills in reviewId, seq, reviewer, inputSnapshotDigest, recordedAt, recordedBy and decisionDigest; setting any of them here is refused rather than overridden. inputSnapshotDigest in particular is copied from the task, so a decision cannot claim to have been made against a snapshot it was not. Approving requires requirementsRevision, and it must name one of the task's declared inputs: an approval anchored to a revision the task never depended on could never go stale when the real requirement moved. The findings below include an open `minor`; only an unresolved `blocker` refuses an approval, because forcing the reviewer to choose between blocking and downgrading produces blockers relabelled as minors. validationEvidence is empty here, which is an honest statement that this judgement was made by inspection: each id in it must resolve to evidence recorded in this session, for this task, against this same candidate — a citation nobody can follow is decoration, and one about a different candidate is false confidence. Run the checks with `teamctl validate run` first and cite what it prints. See schemas/review-decision.schema.json for the stored shape and protocol/review.md for how a decision is consumed.",
   "sessionId": "feature:example",
   "taskId": "task:example",
   "status": "approved",
@@ -20,7 +20,5 @@
       "requiredOutcome": "The key includes the coupon id, or the log line names it separately."
     }
   ],
-  "validationEvidence": [
-    "npm test"
-  ]
+  "validationEvidence": []
 }

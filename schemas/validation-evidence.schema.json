@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/crazycola23/team-layer/schemas/validation-evidence.schema.json",
+  "title": "Validation Evidence",
+  "description": "What happened when one `command` check from a task's frozen validation plan was actually run (plan §6).\n\nEvidence binds the observation to what it was an observation *of*: the exact candidate (`candidateRevision`) and the exact semantic input snapshot (`inputSnapshotDigest`). Both are load-bearing, and for the same reason an approval names both — a passing test attached only to a commit survives the contract changing underneath it, which is how a green gate comes to mean nothing. Staleness is derived by comparing these against current truth, never stored: a `stale` flag stops being true the moment the candidate moves and nobody goes back to update it (plan §17 Scenario 5).\n\nA gate reads this file to decide whether work may proceed, so the record is sealed by `recordDigest` and the seal is checked on every read. But the seal covers the *whole* record, unlike handoff.schema.json and review-decision.schema.json, which digest a substance-only half so that recording the same statement twice is detectable. That split is deliberate there and deliberately absent here: a judgement made twice is suspicious, while an observation made twice is ordinary — rerunning the suite on the same candidate is what a careful Agent does, and the second run is a second fact rather than a duplicate of the first. Sealing everything, `seq` and `recordedAt` included, says \"this record is as it was written\" without also claiming \"this observation is unique\".\n\nOnly `command` checks produce evidence. A `review` check is answered from the review decision itself, which is already a first-class artifact; recording a second copy of a judgement here would create two places that could disagree about what the reviewer said.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "seq",
+    "evidenceId",
+    "sessionId",
+    "taskId",
+    "checkId",
+    "candidateRevision",
+    "inputSnapshotDigest",
+    "status",
+    "resultDigest",
+    "exitCode",
+    "durationMs",
+    "outputExcerpt",
+    "outputTruncated",
+    "recordedAt",
+    "recordedBy",
+    "recordDigest"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "evidenceId": {
+      "description": "Assigned by the ledger as evidence:<check-id>-<seq>. The sequence number is part of the id because reruns are expected: the same check against the same candidate can be observed more than once, and each observation needs its own name.",
+      "$ref": "id.schema.json"
+    },
+    "seq": {
+      "description": "Position in this session's evidence order, assigned under the session lock. Evidence for different tasks and checks interleaves, so this is the only total ordering available.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "sessionId": { "$ref": "id.schema.json" },
+    "taskId": { "$ref": "id.schema.json" },
+    "checkId": {
+      "description": "Which check in the task's frozen plan this is evidence for. Resolved against that plan when recorded, so evidence cannot be filed for a check the task never declared.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+    },
+    "candidateRevision": {
+      "description": "Exactly what was tested. Any revision scheme, not only git, for the same reason review decisions allow it: plan §13 anticipates naming a work-product digest instead of a commit so that a rebase changing no substance does not discard the result.",
+      "$ref": "revision.schema.json"
+    },
+    "inputSnapshotDigest": {
+      "description": "The task's input snapshot at the time of the run. Copied from the frozen task rather than asserted by the runner, so it cannot describe a snapshot the check was not actually run against.",
+      "$ref": "digest.schema.json"
+    },
+    "status": { "$ref": "evidence-status.schema.json" },
+    "resultDigest": {
+      "description": "sha256 over the whole captured output, so a recorded result cannot be quietly restated later. Note what this is not: two passing runs of the same suite will not share a digest, because real output carries timings and counts. It identifies an observation; it does not compare them.",
+      "$ref": "digest.schema.json"
+    },
+    "exitCode": {
+      "description": "The process exit status, or null when there was none — the check errored before exiting, or was killed. Kept alongside `status` because `failed` says the candidate is wrong while the exit code often says how.",
+      "type": ["integer", "null"]
+    },
+    "durationMs": {
+      "description": "Wall-clock milliseconds. Not a digested part of the result: the same check on the same candidate takes a different time every run, and treating that as substance would make every rerun look like a different observation.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "outputExcerpt": {
+      "description": "The tail of the captured output, up to 2000 characters. The tail rather than the head because a failing run puts the reason at the end and the head is setup noise. Empty is legitimate — a quiet command that exits 0 says everything by exiting 0.",
+      "type": "string",
+      "maxLength": 2000
+    },
+    "outputTruncated": {
+      "description": "Whether output was dropped from the excerpt. Recorded explicitly so a reader can tell a short run from a truncated one; the digest still covers the full output either way.",
+      "type": "boolean"
+    },
+    "note": {
+      "description": "Why an `errored` check could not tell us anything — a missing binary, a timeout, a signal. Present only when the runner has something to say that the exit code cannot.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 300
+    },
+    "recordedAt": { "$ref": "timestamp.schema.json" },
+    "recordedBy": { "$ref": "id.schema.json" },
+    "recordDigest": {
+      "description": "sha256 over every other field of this record, checked on every read. A gate consults evidence to decide whether work may proceed, so a `status` that could be edited from `failed` to `passed` on disk would be a pass anyone could manufacture — the same reason review decisions are sealed. Verified on read rather than offered as a separate `verify` command, because a check nobody runs is not a check.",
+      "$ref": "digest.schema.json"
+    }
+  }
+}

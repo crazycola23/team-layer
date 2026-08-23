@@ -16,6 +16,7 @@ import { inputSnapshotDigest, DigestError, REVISION_PATTERN, DIGEST_PATTERN, GIT
 import { SESSION_STATUSES, TASK_STATUSES, HANDOFF_ACTIONS, REVIEW_STATUSES, FINDING_SEVERITIES, FINDING_STATUSES } from '../src/ledger.mjs';
 import { ID_PATTERN, MAX_ID_LENGTH } from '../src/slug.mjs';
 import { SKILL_ROOT, roleIds, registryDigest } from '../src/roles.mjs';
+import { VALIDATION_KINDS, VALIDATION_GATES, EVIDENCE_STATUSES } from '../src/validation.mjs';
 
 const check = process.argv.includes('--check');
 const stale = [];
@@ -161,6 +162,41 @@ emit('schemas/finding-status.schema.json', {
   'x-generated-from': 'src/ledger.mjs FINDING_STATUSES',
   type: 'string',
   enum: FINDING_STATUSES,
+});
+
+// --------------------------------------------------- validation vocabularies
+// The runner in src/validation.mjs is what actually branches on these, and the
+// ledger refuses a plan whose values it does not recognise. A gate the schema
+// allowed but the runner had never heard of would validate into a frozen packet
+// and then be silently required by nothing.
+emit('schemas/validation-kind.schema.json', {
+  $schema: 'https://json-schema.org/draft/2020-12/schema',
+  $id: 'https://github.com/crazycola23/team-layer/schemas/validation-kind.schema.json',
+  title: 'Validation check kind',
+  description: 'How a check is satisfied: by running something, or by somebody judging it. Both are semantic evidence about one candidate and both go stale the same way, which is why a gate can weigh them together (plan §6, §7).',
+  'x-generated-from': 'src/validation.mjs VALIDATION_KINDS',
+  type: 'string',
+  enum: VALIDATION_KINDS,
+});
+
+emit('schemas/validation-gate.schema.json', {
+  $schema: 'https://json-schema.org/draft/2020-12/schema',
+  $id: 'https://github.com/crazycola23/team-layer/schemas/validation-gate.schema.json',
+  title: 'Validation gate',
+  description: 'When a check is required. Gates rather than one "must pass" flag because demanding every check at every step is how the step gets skipped. `revalidation` is the gate spec-suite drives after a structural replay (plan §7).',
+  'x-generated-from': 'src/validation.mjs VALIDATION_GATES',
+  type: 'string',
+  enum: VALIDATION_GATES,
+});
+
+emit('schemas/evidence-status.schema.json', {
+  $schema: 'https://json-schema.org/draft/2020-12/schema',
+  $id: 'https://github.com/crazycola23/team-layer/schemas/evidence-status.schema.json',
+  title: 'Validation evidence status',
+  description: 'What running a check concluded. `errored` is deliberately not `failed`: a missing binary or a timeout is nobody\'s evidence about the code, and collapsing the two sends the implementer to look for a bug that is not there.',
+  'x-generated-from': 'src/validation.mjs EVIDENCE_STATUSES',
+  type: 'string',
+  enum: EVIDENCE_STATUSES,
 });
 
 // -------------------------------------------------- input snapshot test vectors

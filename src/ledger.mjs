@@ -29,7 +29,8 @@ import path from 'node:path';
 
 import { jsonDigest, inputSnapshotDigest, assertRevision } from './digest.mjs';
 import { isRole, roleIds } from './roles.mjs';
-import { assertId, slug, unslug } from './slug.mjs';
+import { assertId, slug, unslug, SlugError } from './slug.mjs';
+import { planProblems, checksRequiredAt, EVIDENCE_STATUSES, VALIDATION_GATES } from './validation.mjs';
 
 export class LedgerError extends Error {
   constructor(code, message, details) {
@@ -632,6 +633,27 @@ export class Ledger {
       );
     }
     if (packet.baseRevision !== undefined) assertRevision(packet.baseRevision, 'packet.baseRevision');
+    // `validation: string[]` was the v1 field: a list of commands nobody ran, checked
+    // against nothing. It is refused by name rather than ignored, because a packet
+    // carrying both would freeze two answers to "how is this shown to be done" and a
+    // later reader would have no way to know which one the gate consulted.
+    if (packet.validation !== undefined) {
+      throw new LedgerError('MALFORMED_TASK',
+        'packet.validation was replaced by packet.validationPlan in schemaVersion 2 (plan §6); '
+          + 'a list of command strings could not be run, resolved, or gated on. Convert it to checks.');
+    }
+    // The plan is checked here, at the only door into frozen truth, because this is
+    // the last moment it can be checked at all: afterwards it is inside a digest, and
+    // refusing it would mean asking somebody to restate a task under a new generation
+    // to fix a typo. Every problem is reported at once for the same reason — one
+    // refusal per round trip is how a plan ends up with the checks that were easy to
+    // write instead of the ones that were needed.
+    const problems = planProblems(packet.validationPlan, 'packet.validationPlan');
+    if (problems.length) {
+      throw new LedgerError('MALFORMED_TASK',
+        `the validation plan is not usable:\n- ${problems.join('\n- ')}`,
+        { problems });
+    }
     const frozen = { ...packet, sessionId };
     const digest = inputSnapshotDigest(frozen.inputs ?? [], `task ${frozen.taskId} inputs`);
     const at = nowIso();
@@ -1129,6 +1151,10 @@ export class Ledger {
       || validationEvidence.some((id) => typeof id !== 'string' || id.trim() === '')) {
       throw new LedgerError('MALFORMED_REVIEW', 'validationEvidence must be an array of non-empty ids');
     }
+    if (new Set(validationEvidence).size !== validationEvidence.length) {
+      throw new LedgerError('MALFORMED_REVIEW',
+        'validationEvidence lists the same evidence twice, which would make one run look like two');
+    }
 
     const unresolved = findings.filter((f) => FINDING_UNRESOLVED.has(f.status));
     // A decision that contradicts its own findings is the review equivalent of a
@@ -1196,6 +1222,44 @@ export class Ledger {
               `(${declared.map((i) => `${i.id}@${i.revision}`).join(', ') || 'none'}). An approval anchored to a ` +
               'revision the task never depended on cannot go stale when the real requirement moves.',
             { requirementsRevision: draft.requirementsRevision, taskId });
+        }
+      }
+
+      // What an approval says it stands on has to be checkable, or the field is
+      // decoration: before this, `validationEvidence: ["npm test"]` was a free string
+      // that named nothing and no reader could confirm. Each id must resolve to
+      // evidence in this session, for this task, about this candidate.
+      for (const id of validationEvidence) {
+        let evidence;
+        try {
+          evidence = this.readEvidence(sessionId, id);
+        } catch (error) {
+          // SlugError as well as LedgerError: `validationEvidence: ["npm test"]` — the
+          // v1 shape — is not even id-shaped, and the reviewer who wrote it needs the
+          // sentence about what evidence is, not a lexical complaint about slugs.
+          if (!(error instanceof LedgerError) && !(error instanceof SlugError)) throw error;
+          throw new LedgerError('REVIEW_EVIDENCE_UNKNOWN',
+            `validationEvidence names ${id}, which does not resolve to evidence in session ${sessionId} `
+              + `(${error.code}). A citation nobody can follow is not evidence; record the run first, `
+              + 'or leave the list empty to say the judgement was by inspection.',
+            { evidenceId: id, cause: error.code });
+        }
+        if (evidence.taskId !== taskId) {
+          throw new LedgerError('REVIEW_EVIDENCE_UNKNOWN',
+            `validationEvidence names ${id}, which is evidence for task ${evidence.taskId}, not ${taskId}`,
+            { evidenceId: id, taskId: evidence.taskId });
+        }
+        // A citation about other code is the precise shape of false confidence this
+        // design exists to refuse: the approval would look like it stood on a passing
+        // run that was never made against what was approved. A reviewer who means to
+        // rely on an older run can say so in `summary`, where it reads as a caveat
+        // rather than as a measurement.
+        if (evidence.candidateRevision !== draft.candidateRevision) {
+          throw new LedgerError('REVIEW_EVIDENCE_MISMATCH',
+            `validationEvidence names ${id}, which was recorded against candidate ${evidence.candidateRevision}, `
+              + `but this review is of ${draft.candidateRevision}. Rerun the check against the candidate being `
+              + 'reviewed, or describe the older run in the summary instead of citing it as evidence.',
+            { evidenceId: id, observed: evidence.candidateRevision, reviewing: draft.candidateRevision });
         }
       }
 
@@ -1302,6 +1366,290 @@ export class Ledger {
         requirementsRevision: d.requirementsRevision ?? null,
       },
       current,
+    };
+  }
+
+  // ------------------------------------------------------------------ validation
+
+  evidenceDir(sessionId) {
+    return path.join(this.sessionDir(sessionId), 'evidence');
+  }
+
+  evidenceFile(sessionId, evidenceId) {
+    return path.join(this.evidenceDir(sessionId), `${slug(evidenceId, 'evidenceId')}.json`);
+  }
+
+  /** Every evidence record in the session, oldest first. */
+  listEvidence(sessionId, { taskId = null, checkId = null } = {}) {
+    const dir = this.evidenceDir(sessionId);
+    if (!fs.existsSync(dir)) return [];
+    return fs.readdirSync(dir)
+      .filter((name) => name.endsWith('.json'))
+      .map((name) => this.readEvidence(sessionId, unslug(name.slice(0, -'.json'.length))))
+      .filter((record) => (taskId === null || record.taskId === taskId)
+        && (checkId === null || record.checkId === checkId))
+      .sort((a, b) => a.seq - b.seq);
+  }
+
+  /**
+   * Read one evidence record, proving it has not been edited since it was recorded.
+   *
+   * Checked on every read for the same reason `readReview` is: a gate consults this
+   * to decide whether work may proceed, so a `status` anyone could flip on disk is a
+   * pass anyone could manufacture. The seal covers the whole record here, `seq` and
+   * `recordedAt` included — there is no substance-only half, because two runs of the
+   * same check are two facts rather than one statement made twice.
+   */
+  readEvidence(sessionId, evidenceId) {
+    assertId(sessionId, 'sessionId');
+    assertId(evidenceId, 'evidenceId');
+    const file = this.evidenceFile(sessionId, evidenceId);
+    const record = readJson(file, `evidence ${evidenceId}`);
+    const { recordDigest, ...sealed } = record;
+    const actual = jsonDigest(sealed);
+    if (actual !== recordDigest) {
+      throw new LedgerError(
+        'EVIDENCE_TAMPERED',
+        `evidence ${evidenceId} does not match its recorded digest; it was edited after being recorded. `
+          + 'Rerun the check instead of trusting this file.',
+        { file, recorded: recordDigest ?? null, actual },
+      );
+    }
+    return record;
+  }
+
+  /**
+   * Record what happened when one `command` check was run (plan §6).
+   *
+   * The result is the runner's to produce and this method's to bind: `src/validation.mjs`
+   * says what a run concluded, and here that conclusion is attached to the candidate
+   * and the input snapshot it was a conclusion about. Neither half is useful alone —
+   * a status with no candidate cannot go stale, and a candidate with no status says
+   * nothing.
+   *
+   * There is deliberately no `REVIEW_SELF` analogue. Running a test is not a
+   * judgement: the suite does not care who invoked it, and refusing an implementer's
+   * own run would only mean the check gets run and not recorded, which is worse than
+   * recording who ran it and letting the reviewer weigh that.
+   *
+   * Recording evidence moves neither the task nor the session, for the same reason
+   * recording a review does not: it is an input to a gate, not the gate.
+   */
+  recordEvidence({ sessionId, taskId, checkId, candidateRevision, result, inputSnapshotDigest = undefined, actor = this.actor }) {
+    assertId(sessionId, 'sessionId');
+    assertId(taskId, 'taskId');
+    assertRevision(candidateRevision, 'candidateRevision');
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+      throw new LedgerError('MALFORMED_EVIDENCE', 'a result must be an object as returned by runCommandCheck');
+    }
+    // A distinct code from MALFORMED_EVIDENCE for the same reason UNKNOWN_REVIEW_STATUS
+    // is distinct from MALFORMED_REVIEW: a misspelled status is a fixable typo rather
+    // than a shape error, and the two want different fixes.
+    if (!EVIDENCE_STATUSES.includes(result.status)) {
+      throw new LedgerError('UNKNOWN_EVIDENCE_STATUS',
+        `result.status must be one of ${EVIDENCE_STATUSES.join(', ')}, got ${JSON.stringify(result.status)}`);
+    }
+    if (typeof result.resultDigest !== 'string' || result.resultDigest === '') {
+      throw new LedgerError('MALFORMED_EVIDENCE', 'result.resultDigest must name the output this conclusion came from');
+    }
+    if (!Number.isInteger(result.durationMs) || result.durationMs < 0) {
+      throw new LedgerError('MALFORMED_EVIDENCE', 'result.durationMs must be a non-negative integer');
+    }
+    if (result.exitCode !== null && !Number.isInteger(result.exitCode)) {
+      throw new LedgerError('MALFORMED_EVIDENCE',
+        'result.exitCode must be an integer, or null when the check never exited');
+    }
+    if (typeof result.outputExcerpt !== 'string') {
+      throw new LedgerError('MALFORMED_EVIDENCE', 'result.outputExcerpt must be a string; an empty one is legitimate');
+    }
+
+    return this.withLock(sessionId, () => {
+      const session = this.readSession(sessionId);
+      const task = this.readTask(sessionId, taskId);
+      const plan = task.frozen.validationPlan ?? [];
+      const check = plan.find((entry) => entry.checkId === checkId);
+      // Evidence for a check the task never declared would be a green light nobody
+      // asked for: no gate consults it, and it reads in `validate show` exactly like
+      // one that was required. The plan is frozen, so this is answerable exactly.
+      if (!check) {
+        throw new LedgerError('EVIDENCE_CHECK_UNKNOWN',
+          `task ${taskId} declares no check ${JSON.stringify(checkId)} `
+            + `(it declares ${plan.map((entry) => entry.checkId).join(', ') || 'none'}). `
+            + 'Evidence must answer a check the packet actually asks for.',
+          { taskId, checkId, declared: plan.map((entry) => entry.checkId) });
+      }
+      if (check.kind !== 'command') {
+        throw new LedgerError('EVIDENCE_KIND_MISMATCH',
+          `check ${checkId} is a ${check.kind} check, which is answered by a recorded review decision, `
+            + 'not by evidence. Recording it here would put the same judgement in two places.',
+          { taskId, checkId, kind: check.kind });
+      }
+      const snapshot = task.inputSnapshotDigest;
+      if (inputSnapshotDigest !== undefined && inputSnapshotDigest !== snapshot) {
+        throw new LedgerError('EVIDENCE_STALE',
+          `the check was run against input snapshot ${inputSnapshotDigest}, but task ${taskId} is now at `
+            + `${snapshot}. Re-read the task and rerun the check against current truth.`,
+          { declared: inputSnapshotDigest, current: snapshot, taskId });
+      }
+
+      const seq = (session.evidenceSeq ?? 0) + 1;
+      const evidenceId = `evidence:${checkId}-${seq}`;
+      const file = this.evidenceFile(sessionId, evidenceId);
+      if (fs.existsSync(file)) {
+        throw new LedgerError('EVIDENCE_EXISTS',
+          `evidence ${evidenceId} already exists at ${file}; session.evidenceSeq disagrees with the directory`);
+      }
+      const at = nowIso();
+      const sealed = {
+        schemaVersion: 1,
+        seq,
+        evidenceId,
+        sessionId,
+        taskId,
+        checkId,
+        candidateRevision,
+        inputSnapshotDigest: snapshot,
+        status: result.status,
+        resultDigest: result.resultDigest,
+        exitCode: result.exitCode ?? null,
+        durationMs: result.durationMs,
+        outputExcerpt: result.outputExcerpt,
+        outputTruncated: result.outputTruncated === true,
+        ...(result.note ? { note: result.note } : {}),
+        recordedAt: at,
+        recordedBy: actor,
+      };
+      const record = { ...sealed, recordDigest: jsonDigest(sealed) };
+      fs.mkdirSync(this.evidenceDir(sessionId), { recursive: true });
+      writeJsonAtomic(file, record);
+      session.evidenceSeq = seq;
+      this.#commit(session, {
+        kind: 'evidence-recorded',
+        at,
+        actor,
+        evidenceId,
+        taskId,
+        checkId,
+        status: record.status,
+        candidateRevision,
+        inputSnapshotDigest: snapshot,
+        exitCode: record.exitCode,
+        resultDigest: record.resultDigest,
+      });
+      return record;
+    });
+  }
+
+  /**
+   * Whether one task satisfies one gate, and if not, what is missing (plan §6, §7).
+   *
+   * Three-valued on purpose. `passed` and `failed` are not enough, because the
+   * interesting state is neither: evidence exists but describes a candidate that has
+   * since moved. Calling that `failed` sends the implementer to fix a test that is
+   * passing, and calling it `passed` merges work nothing was actually run against.
+   * `unknown` is the answer that makes the next action obvious — rerun it.
+   *
+   * `failed` outranks `unknown` at the gate: one check that definitively fails on the
+   * current candidate settles the question no matter how much else is unmeasured.
+   *
+   * Nothing is stored. Like `reviewStateFor`, the answer is derived on every call so
+   * that it cannot be out of date, only unknown — and `candidateRevision` is the
+   * caller's to supply, because this layer does not run git.
+   */
+  validationStateFor(sessionId, taskId, { gate, candidateRevision = null } = {}) {
+    assertId(sessionId, 'sessionId');
+    assertId(taskId, 'taskId');
+    if (!VALIDATION_GATES.includes(gate)) {
+      throw new LedgerError('UNKNOWN_VALIDATION_GATE',
+        `gate must be one of ${VALIDATION_GATES.join(', ')}, got ${JSON.stringify(gate)}`);
+    }
+    if (candidateRevision !== null) assertRevision(candidateRevision, 'candidateRevision');
+    const task = this.readTask(sessionId, taskId);
+    const current = { candidateRevision, inputSnapshotDigest: task.inputSnapshotDigest };
+    const required = checksRequiredAt(task.frozen.validationPlan ?? [], gate);
+    const checks = required.map((check) => (check.kind === 'review'
+      ? this.#reviewCheckState(sessionId, taskId, check, candidateRevision)
+      : this.#commandCheckState(sessionId, taskId, check, candidateRevision, task.inputSnapshotDigest)));
+    // A gate with no checks is an authoring decision, not an oversight: the plan must
+    // declare at least one check and every check at least one gate, so an empty gate
+    // means this task genuinely asks for nothing here. Reported as `passed` with the
+    // reason attached, so a caller printing it says "nothing is required at handoff"
+    // rather than implying something was verified.
+    let status;
+    if (checks.some((c) => c.status === 'failed')) status = 'failed';
+    else if (checks.some((c) => c.status === 'unknown')) status = 'unknown';
+    else status = 'passed';
+    return {
+      sessionId,
+      taskId,
+      gate,
+      status,
+      required: checks.length,
+      passed: checks.filter((c) => c.status === 'passed').length,
+      failed: checks.filter((c) => c.status === 'failed').length,
+      unknown: checks.filter((c) => c.status === 'unknown').length,
+      checks,
+      ...(checks.length === 0 ? { reasons: ['no-checks-required'] } : {}),
+      current,
+    };
+  }
+
+  #commandCheckState(sessionId, taskId, check, candidateRevision, snapshot) {
+    const history = this.listEvidence(sessionId, { taskId, checkId: check.checkId });
+    const latest = history.at(-1);
+    const base = { checkId: check.checkId, kind: check.kind, runs: history.length };
+    if (!latest) {
+      return { ...base, status: 'unknown', reasons: ['no-evidence'], evidenceId: null, observed: null };
+    }
+    const reasons = [];
+    if (latest.inputSnapshotDigest !== snapshot) reasons.push('inputs-moved');
+    if (candidateRevision !== null && latest.candidateRevision !== candidateRevision) reasons.push('candidate-moved');
+    if (candidateRevision === null) reasons.push('candidate-unknown');
+    // `errored` is a reason the check told us nothing, not a verdict on the code —
+    // see src/validation.mjs. It reads as unknown here so the next action is "make the
+    // runner work", not "fix the candidate".
+    if (latest.status === 'errored') reasons.push('errored');
+    let status;
+    if (reasons.length) status = 'unknown';
+    else status = latest.status === 'passed' ? 'passed' : 'failed';
+    return {
+      ...base,
+      status,
+      reasons,
+      evidenceId: latest.evidenceId,
+      observed: {
+        status: latest.status,
+        candidateRevision: latest.candidateRevision,
+        inputSnapshotDigest: latest.inputSnapshotDigest,
+        exitCode: latest.exitCode,
+        recordedAt: latest.recordedAt,
+        recordedBy: latest.recordedBy,
+      },
+    };
+  }
+
+  #reviewCheckState(sessionId, taskId, check, candidateRevision) {
+    const state = this.reviewStateFor(sessionId, taskId, { candidateRevision });
+    const base = { checkId: check.checkId, kind: check.kind, role: check.role, reviewId: state.reviewId };
+    if (state.applies !== true) {
+      return { ...base, status: 'unknown', reasons: state.reasons, observed: state.observed };
+    }
+    // The plan names a role, so an approval from the wrong capacity does not satisfy
+    // it. Unknown rather than failed: somebody did approve this candidate, and the
+    // missing thing is the required reviewer's answer, not a verdict against the work.
+    if (state.reviewer?.role !== check.role) {
+      return {
+        ...base,
+        status: 'unknown',
+        reasons: ['role-mismatch'],
+        observed: { ...state.observed, role: state.reviewer?.role ?? null },
+      };
+    }
+    return {
+      ...base,
+      status: state.status === 'approved' ? 'passed' : 'failed',
+      reasons: state.status === 'approved' ? [] : [state.status],
+      observed: { ...state.observed, role: state.reviewer.role, unresolvedFindings: state.unresolvedFindings },
     };
   }
 }

@@ -9,6 +9,7 @@ import { roleIds, isRole, roleFile, roleVersion } from '../src/roles.mjs';
 import { Ledger, LedgerError, SESSION_STATUSES, TASK_STATUSES, HANDOFF_ACTIONS, REVIEW_STATUSES } from '../src/ledger.mjs';
 import { SlugError } from '../src/slug.mjs';
 import { DigestError } from '../src/digest.mjs';
+import { runCommandCheck, checksRequiredAt, VALIDATION_GATES } from '../src/validation.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const SCRIPT_DIR = path.dirname(__filename);
@@ -448,6 +449,18 @@ function runLedger(fn) {
   }
 }
 
+/**
+ * Refuse from the CLI in the shape the ledger refuses in.
+ *
+ * A few refusals belong here rather than in the ledger, because they are about the
+ * worktree and the ledger deliberately knows nothing about git. Callers should not
+ * have to learn a second failure format to discover that.
+ */
+function refuse(code, message, details = null) {
+  console.error(JSON.stringify({ status: 'refused', code, message, ...(details ? { details } : {}) }, null, 2));
+  process.exit(3);
+}
+
 function sessionCommand(args) {
   const sub = args._[1];
   const { ledger } = ledgerFor(args);
@@ -691,6 +704,101 @@ function reviewCommand(args) {
   });
 }
 
+function validateCommand(args) {
+  const sub = args._[1];
+  const { repo, ledger } = ledgerFor(args);
+  runLedger(() => {
+    if (sub === 'run') {
+      const sessionId = requireFlag(args, 'session');
+      const taskId = requireFlag(args, 'task');
+      const task = ledger.readTask(sessionId, taskId);
+      const plan = task.frozen.validationPlan ?? [];
+      // Which checks to run, narrowest request first. A gate rather than "all" is the
+      // common case: the point of gates is that a handoff does not owe the merge
+      // checks, and running them anyway is how the fast path stops being fast.
+      let selected;
+      if (typeof args.check === 'string') {
+        selected = plan.filter((check) => check.checkId === args.check);
+        if (!selected.length) {
+          die(`task ${taskId} declares no check ${JSON.stringify(args.check)} `
+            + `(it declares ${plan.map((c) => c.checkId).join(', ') || 'none'})`);
+        }
+      } else if (typeof args.gate === 'string') {
+        if (!VALIDATION_GATES.includes(args.gate)) {
+          die(`--gate must be one of ${VALIDATION_GATES.join(', ')}, got ${JSON.stringify(args.gate)}`);
+        }
+        selected = checksRequiredAt(plan, args.gate);
+      } else {
+        selected = plan;
+      }
+      const runnable = selected.filter((check) => check.kind === 'command');
+      // Evidence names the commit it is evidence about. With modified tracked files in
+      // the worktree, that name is false: the suite ran against something no commit
+      // contains, and the record would look exactly like one that had. There is no
+      // --allow-dirty, because a flag that records a knowingly-wrong candidate is
+      // worse than no check at all — it makes the lie deliberate and repeatable.
+      const dirty = git(['status', '--porcelain', '--untracked-files=no'], repo.root);
+      if (dirty !== '') {
+        refuse('WORKTREE_DIRTY',
+          'the worktree has uncommitted changes to tracked files, so evidence recorded now would name '
+            + 'a candidate that is not what ran; commit or stash first',
+          { changes: dirty.split('\n') });
+      }
+      const candidateRevision = typeof args.candidate === 'string' && args.candidate !== ''
+        ? args.candidate
+        : `git:${git(['rev-parse', 'HEAD'], repo.root)}`;
+      const records = [];
+      for (const check of runnable) {
+        const result = runCommandCheck(check, { cwd: repo.root });
+        // The snapshot read before the run is asserted on record, so a task restated
+        // while a long suite was running is refused rather than credited: the result
+        // describes inputs that are no longer the task's.
+        records.push(ledger.recordEvidence({
+          sessionId,
+          taskId,
+          checkId: check.checkId,
+          candidateRevision,
+          result,
+          inputSnapshotDigest: task.inputSnapshotDigest,
+        }));
+      }
+      // The review checks in the selection are reported, not run: nothing here can
+      // produce a human judgement, and silently dropping them would let `validate run`
+      // look like it had covered the gate.
+      emit({
+        sessionId,
+        taskId,
+        candidateRevision,
+        ran: records.length,
+        evidence: records,
+        awaitingReview: selected.filter((check) => check.kind === 'review')
+          .map((check) => ({ checkId: check.checkId, role: check.role })),
+      });
+    } else if (sub === 'show') {
+      const sessionId = requireFlag(args, 'session');
+      if (typeof args.evidence === 'string') {
+        emit(ledger.readEvidence(sessionId, args.evidence));
+        return;
+      }
+      emit(ledger.listEvidence(sessionId, {
+        taskId: typeof args.task === 'string' ? args.task : null,
+        checkId: typeof args.check === 'string' ? args.check : null,
+      }));
+    } else if (sub === 'state') {
+      // Defaults to this worktree's HEAD for the same reason `review state` does: the
+      // question actually being asked is "does what I have now pass", and making the
+      // caller paste a revision invites pasting the one that passed.
+      const candidateRevision = typeof args.candidate === 'string' && args.candidate !== ''
+        ? args.candidate
+        : `git:${git(['rev-parse', 'HEAD'], repo.root)}`;
+      emit(ledger.validationStateFor(requireFlag(args, 'session'), requireFlag(args, 'task'),
+        { gate: requireFlag(args, 'gate'), candidateRevision }));
+    } else {
+      die(`unknown validate subcommand ${sub ?? '(none)'}`);
+    }
+  });
+}
+
 function usage() {
   console.log(`Persistent Agent Team helper\n\n` +
     `Identity:\n` +
@@ -717,12 +825,19 @@ function usage() {
     `  review record      --review <decision.json> [--session <id>]\n` +
     `  review show        --session <id> [--review <review-id>]\n` +
     `  review state       --session <id> --task <id> [--candidate <revision>]   Does the latest decision still apply?\n\n` +
-    `  next action:    ${HANDOFF_ACTIONS.join(', ')}\n` +
-    `  session status: ${SESSION_STATUSES.join(', ')}\n` +
-    `  task status:    ${TASK_STATUSES.join(', ')}\n` +
-    `  review status:  ${REVIEW_STATUSES.join(', ')}\n\n` +
+    `Validation (the task's frozen plan, run and cited rather than remembered):\n` +
+    `  validate run       --session <id> --task <id> [--gate <gate>|--check <check-id>] [--candidate <revision>]\n` +
+    `  validate show      --session <id> [--task <id>] [--check <check-id>] [--evidence <evidence-id>]\n` +
+    `  validate state     --session <id> --task <id> --gate <gate> [--candidate <revision>]   Is this gate satisfied?\n\n` +
+    `  next action:      ${HANDOFF_ACTIONS.join(', ')}\n` +
+    `  session status:   ${SESSION_STATUSES.join(', ')}\n` +
+    `  task status:      ${TASK_STATUSES.join(', ')}\n` +
+    `  review status:    ${REVIEW_STATUSES.join(', ')}\n` +
+    `  validation gate:  ${VALIDATION_GATES.join(', ')}\n\n` +
     `Exit codes:\n` +
-    `  0 ok   1 usage error   2 unhealthy (doctor)   3 ledger refused   4 refused but retryable (re-read, retry)\n\n` +
+    `  0 ok   1 usage error   2 unhealthy (doctor)   3 ledger refused   4 refused but retryable (re-read, retry)\n` +
+    `  A failing check is not an error: \`validate run\` and \`validate state\` answer at 0 and put the\n` +
+    `  verdict in status, because "the suite failed" and "I could not ask" need different responses.\n\n` +
     `Environment:\n` +
     `  AGENT_TEAM_HOME   Durable identity root (default ~/.agent-team)\n`);
 }
@@ -742,4 +857,5 @@ else if (command === 'task') taskCommand(args);
 else if (command === 'handoff') handoffCommand(args);
 else if (command === 'inbox') inbox(args);
 else if (command === 'review') reviewCommand(args);
+else if (command === 'validate') validateCommand(args);
 else die(`unknown command ${command}`);

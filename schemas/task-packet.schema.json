@@ -16,11 +16,12 @@
     "writeSet",
     "inputs",
     "acceptance",
-    "validation"
+    "validationPlan"
   ],
   "properties": {
     "schemaVersion": {
-      "const": 1
+      "description": "2 replaced v1's inert `validation: string[]` with a `validationPlan` of real checks. A version bump rather than a tolerated addition because the two cannot coexist honestly: a reader that accepted both could not tell a task with no checks from one whose checks it did not understand, and would have to guess which of those means \"safe to merge\".",
+      "const": 2
     },
     "taskId": {
       "$ref": "id.schema.json"
@@ -89,13 +90,14 @@
       },
       "uniqueItems": true
     },
-    "validation": {
+    "validationPlan": {
+      "description": "How this task will be shown to be done (plan §6). Replaces v1's `validation: string[]`, which was a list of commands nobody ran and nothing checked against — validation by remembering to.\n\nAt least one check, because a task that declares no way to be verified cannot be verified, and \"we'll know when we see it\" is the state this whole layer exists to end.\n\nThe plan is inside the frozen half on purpose, and that is what makes the rest of the mechanism trustworthy: an Agent cannot add a check that passes, drop one that fails, or edit the command it is judged by. Changing the plan means restating the task under a new generation, which is visible to everyone. It is also the reason a `command` check can be run through a shell at all — the string executed is the one the packet author froze, not one the subject supplied.",
       "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
       "items": {
-        "type": "string",
-        "minLength": 1
-      },
-      "uniqueItems": true
+        "$ref": "validation-check.schema.json"
+      }
     }
   }
 }

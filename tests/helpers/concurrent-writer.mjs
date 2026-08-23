@@ -36,7 +36,7 @@ for (let n = 0; n < writers; n += 1) {
   ledger.issueTask({
     sessionId,
     packet: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       taskId: `task:w${index}-${n}`,
       subject: `agent:fullstack-${index}`,
       role: 'fullstack',
@@ -45,7 +45,9 @@ for (let n = 0; n < writers; n += 1) {
       writeSet: [`src/w${index}/**`],
       inputs: [{ id: 'contract:coupon', revision: `sha256:${String(n).repeat(64).slice(0, 64)}`, authority: 'product-architect' }],
       acceptance: ['AC-1'],
-      validation: ['npm test'],
+      validationPlan: [
+        { checkId: 'unit-tests', kind: 'command', requiredAt: ['merge'], command: 'npm test' },
+      ],
     },
   });
 }

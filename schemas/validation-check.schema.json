@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/crazycola23/team-layer/schemas/validation-check.schema.json",
+  "title": "Validation check",
+  "description": "One thing that must be true before a task can pass a gate (plan §6).\n\nA packet used to carry `validation: [\"npm test\"]` — a string nobody ran, checked against nothing, satisfied by remembering to. A check instead names itself (`checkId`), says how it is satisfied (`kind`), and says when it is required (`requiredAt`), which is what lets a gate ask a question with an answer.\n\nThe plan lives inside the frozen, digested half of the task packet. That is the load-bearing property: an Agent cannot add a check that passes, drop one that fails, or edit the command it is judged by without restating the task under a new generation, which is visible. It is also why executing a `command` check through a shell is safe at all — the string run is the one the packet author froze, not one the subject supplied.\n\nThe two kinds are deliberately one vocabulary rather than two mechanisms. A test run and a human judgement are both semantic evidence about one candidate, both go stale when the candidate or the inputs move, and a gate has to weigh them together (plan §7). A `review` check is answered by looking at review decisions (`reviewStateFor`), not by recording a second copy of the judgement as evidence.\n\nThe branches are closed objects rather than one open shape, so a `role` on a command check or a `timeoutMs` on a review check is refused instead of ignored. A field that is silently dropped is worse than a rejected one: the author believes they constrained something they did not.",
+  "type": "object",
+  "oneOf": [
+    { "$ref": "#/$defs/commandCheck" },
+    { "$ref": "#/$defs/reviewCheck" }
+  ],
+  "$defs": {
+    "checkId": {
+      "description": "Names this check within its task, and therefore names its evidence. Kebab-case and unique in the plan: two checks sharing an id would make \"unit-tests passed\" ambiguous about which unit tests, and a gate would accept either.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+    },
+    "requiredAt": {
+      "description": "The gates that demand this check. At least one, because a check required nowhere is a note. Gates rather than a single \"must pass\" flag because the same task wants different evidence at different moments — a fast unit run before handing off, the full suite before merge — and demanding everything at every step is how the step gets skipped.",
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "$ref": "validation-gate.schema.json" }
+    },
+    "description": {
+      "description": "What this check is for, in the author's words. For the Agent that has to decide whether a failure is worth escalating; `npm test -- coupon` does not say why.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 300
+    },
+    "commandCheck": {
+      "description": "Satisfied by running something and recording what happened.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["checkId", "kind", "requiredAt", "command"],
+      "properties": {
+        "checkId": { "$ref": "#/$defs/checkId" },
+        "kind": { "$ref": "validation-kind.schema.json", "const": "command" },
+        "requiredAt": { "$ref": "#/$defs/requiredAt" },
+        "command": {
+          "description": "The command line, run through the shell in the task's worktree. One string rather than argv because `npm test -- coupon` is what an author writes, and splitting it here would be a second, worse shell.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "timeoutMs": {
+          "description": "How long the check gets before it is abandoned as `errored`. Omitted means the runner's default. A timeout is not a failure: nothing was learned about the candidate.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "description": { "$ref": "#/$defs/description" }
+      }
+    },
+    "reviewCheck": {
+      "description": "Satisfied by somebody in a named role approving this candidate. Answered from recorded review decisions, which is what makes it go stale the same way a test result does.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["checkId", "kind", "requiredAt", "role"],
+      "properties": {
+        "checkId": { "$ref": "#/$defs/checkId" },
+        "kind": { "$ref": "validation-kind.schema.json", "const": "review" },
+        "requiredAt": { "$ref": "#/$defs/requiredAt" },
+        "role": {
+          "description": "The capacity the approval must be given in. A role rather than a subject: naming a person makes the plan unsatisfiable the moment that Agent's session ends, and the point of the check is independence, not a particular reviewer.",
+          "$ref": "role.schema.json"
+        },
+        "description": { "$ref": "#/$defs/description" }
+      }
+    }
+  }
+}

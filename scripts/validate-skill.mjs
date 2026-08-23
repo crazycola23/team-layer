@@ -22,9 +22,13 @@ const required = [
   'schemas/handoff.schema.json', 'schemas/handoff-action.schema.json',
   'schemas/review-decision.schema.json', 'schemas/review-status.schema.json',
   'schemas/finding-severity.schema.json', 'schemas/finding-status.schema.json',
+  'schemas/validation-check.schema.json', 'schemas/validation-evidence.schema.json',
+  'schemas/validation-kind.schema.json', 'schemas/validation-gate.schema.json',
+  'schemas/evidence-status.schema.json',
   'templates/handoff.md', 'templates/handoff.json', 'templates/task-packet.json', 'templates/finding.json',
   'templates/review-decision.json',
-  'scripts/teamctl.mjs', 'src/ledger.mjs', 'src/slug.mjs', 'src/digest.mjs', 'src/schema.mjs'
+  'scripts/teamctl.mjs', 'src/ledger.mjs', 'src/slug.mjs', 'src/digest.mjs', 'src/schema.mjs',
+  'src/validation.mjs'
 ];
 for (const file of required) ok(fs.existsSync(path.join(ROOT, file)), `missing ${file}`);
 
@@ -49,6 +53,9 @@ const GENERATED = {
   'schemas/review-status.schema.json': 'src/ledger.mjs REVIEW_STATUSES',
   'schemas/finding-severity.schema.json': 'src/ledger.mjs FINDING_SEVERITIES',
   'schemas/finding-status.schema.json': 'src/ledger.mjs FINDING_STATUSES',
+  'schemas/validation-kind.schema.json': 'src/validation.mjs VALIDATION_KINDS',
+  'schemas/validation-gate.schema.json': 'src/validation.mjs VALIDATION_GATES',
+  'schemas/evidence-status.schema.json': 'src/validation.mjs EVIDENCE_STATUSES',
 };
 for (const [file, source] of Object.entries(GENERATED)) {
   if (!fs.existsSync(path.join(ROOT, file))) continue;
@@ -59,7 +66,8 @@ for (const [file, source] of Object.entries(GENERATED)) {
 
 const HAND_WRITTEN = ['schemas/identity.schema.json', 'schemas/task-packet.schema.json',
   'schemas/finding.schema.json', 'schemas/session.schema.json', 'schemas/task-record.schema.json',
-  'schemas/handoff.schema.json', 'schemas/review-decision.schema.json'];
+  'schemas/handoff.schema.json', 'schemas/review-decision.schema.json',
+  'schemas/validation-check.schema.json', 'schemas/validation-evidence.schema.json'];
 for (const file of HAND_WRITTEN) {
   if (!fs.existsSync(path.join(ROOT, file))) continue;
   const body = text(file);
@@ -90,9 +98,22 @@ for (const forbidden of ['harness', 'model', 'taskId', 'worktreeRoot', 'branch']
 }
 
 const taskSchema = JSON.parse(text('schemas/task-packet.schema.json'));
-for (const requiredField of ['baseRevision', 'readSet', 'writeSet', 'inputs', 'acceptance']) {
+for (const requiredField of ['baseRevision', 'readSet', 'writeSet', 'inputs', 'acceptance', 'validationPlan']) {
   ok(taskSchema.required.includes(requiredField), `task packet must require ${requiredField}`);
 }
+/**
+ * v1's `validation: string[]` may not come back alongside the plan (plan §6).
+ *
+ * A list of command strings is a reminder, not a protocol: nothing can run it, no gate
+ * can consult it, and staleness cannot be derived from it. Tolerating both would leave
+ * two answers to "how is this shown to be done", and whichever one a reader believes,
+ * half the toolchain is reading the other. The ledger refuses the field by name; this
+ * keeps the schema from quietly re-opening the door.
+ */
+ok(!Object.keys(taskSchema.properties || {}).includes('validation'),
+  'task packet must not declare `validation`: it was replaced by validationPlan in schemaVersion 2');
+ok(taskSchema.properties.validationPlan?.items?.$ref === 'validation-check.schema.json',
+  'validationPlan items must $ref validation-check.schema.json rather than inlining the check shape');
 
 /**
  * The frozen/state split has to survive editing, because everything downstream
@@ -207,6 +228,20 @@ ok(decision.properties.status?.$ref === 'review-status.schema.json',
   'review status must $ref the generated enum rather than inlining one');
 ok(decision.properties.findings?.items?.$ref === 'finding.schema.json',
   'review findings must $ref finding.schema.json');
+/**
+ * A citation the ledger cannot follow must not validate.
+ *
+ * `recordReview` resolves every entry against this session, this task and this same
+ * candidate, and refuses a repeat. A schema that accepted any non-empty string would
+ * declare `"ran the tests"` a legal citation, and the interchange contract would then
+ * be looser than the thing enforcing it — so the shape is a defect at the point where
+ * the wire format is agreed, not at the point where one implementation happens to be
+ * strict.
+ */
+ok(decision.properties.validationEvidence?.items?.$ref === 'id.schema.json',
+  'validationEvidence must $ref id.schema.json: the ledger resolves these, so prose must not validate');
+ok(decision.properties.validationEvidence?.uniqueItems === true,
+  'validationEvidence must be uniqueItems: one run cited twice would read as two');
 // Any revision scheme, not git only: plan §13 wants to name the candidate by a
 // digest of its work product so a rebase that changes no substance stops throwing
 // the review away, and pinning git here would make that a schema version bump.
@@ -236,6 +271,59 @@ ok(findingSchema.required.includes('evidence') && findingSchema.required.include
 JSON.parse(text('templates/task-packet.json'));
 JSON.parse(text('templates/finding.json'));
 JSON.parse(text('templates/review-decision.json'));
+
+/**
+ * Evidence is an observation, and the seal covers the whole record (plan §6).
+ *
+ * Deliberately the opposite split from a review's. A review digests only the judgement,
+ * so recording the same judgement twice yields one digest and reads as a duplicate. An
+ * observation made twice is ordinary — two runs of one suite are two facts — so there is
+ * nothing to deduplicate, and the record is sealed entire instead. That matters because a
+ * gate reads `status` directly: a field a gate trusts and the digest does not cover is a
+ * pass anyone with write access can forge.
+ *
+ * `outputExcerpt` is capped for the reason handoff prose is: uncapped, it eventually
+ * receives a 200k-line suite log, and a record a gate has to read stops being readable.
+ */
+const evidenceSchema = JSON.parse(text('schemas/validation-evidence.schema.json'));
+ok(evidenceSchema.additionalProperties === false, 'evidence record must be closed');
+ok(evidenceSchema.properties.recordDigest?.$ref === 'digest.schema.json',
+  'recordDigest must $ref digest.schema.json');
+for (const sealed of ['seq', 'evidenceId', 'recordedAt', 'recordedBy', 'status', 'candidateRevision']) {
+  ok(evidenceSchema.required.includes(sealed),
+    `an evidence record must require ${sealed}: the seal covers the whole record, so every part of it must be there`);
+}
+ok(evidenceSchema.properties.status?.$ref === 'evidence-status.schema.json',
+  'evidence status must $ref the generated enum rather than inlining one');
+ok(typeof evidenceSchema.properties.outputExcerpt?.maxLength === 'number',
+  'outputExcerpt must be length-capped: evidence a gate reads, not a transcript');
+for (const derived of ['stale', 'applies', 'current', 'gate']) {
+  ok(!Object.keys(evidenceSchema.properties || {}).includes(derived),
+    `evidence must not store ${derived}: a run answers a check, and which gates need that check is the plan's to say`);
+}
+
+/**
+ * Two closed branches, because src/schema.mjs has no `if/then` and no `not`.
+ *
+ * "A command check may not name a reviewer" is expressed by there being no branch that
+ * allows both — the closure is the enforcement. A single open object with every field
+ * optional would validate a check the runner cannot run, inside a packet that is frozen
+ * by the time anyone finds out.
+ */
+const checkSchema = JSON.parse(text('schemas/validation-check.schema.json'));
+ok(Array.isArray(checkSchema.oneOf) && checkSchema.oneOf.length === 2,
+  'a validation check must be a oneOf over its kinds, since the schema dialect has no if/then');
+for (const branch of ['commandCheck', 'reviewCheck']) {
+  const def = checkSchema.$defs?.[branch];
+  ok(def?.additionalProperties === false, `${branch} must be closed, or the kinds stop being distinguishable`);
+  ok(def?.properties?.kind?.const, `${branch} must pin its kind with const`);
+}
+ok(checkSchema.$defs?.reviewCheck?.properties?.role?.$ref === 'role.schema.json',
+  'a review check must $ref role.schema.json rather than inlining the role list');
+ok(checkSchema.$defs?.requiredAt?.items?.$ref === 'validation-gate.schema.json',
+  'requiredAt items must $ref the generated gate enum rather than inlining one');
+ok(checkSchema.$defs?.requiredAt?.minItems === 1,
+  'a check must name at least one gate: one that gates nothing is a comment');
 
 const reviewer = text('roles/reviewer.md');
 ok(/not a second implementer/i.test(reviewer), 'reviewer must remain independent');

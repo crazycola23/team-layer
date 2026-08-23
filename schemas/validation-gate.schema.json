@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/crazycola23/team-layer/schemas/validation-gate.schema.json",
+  "title": "Validation gate",
+  "description": "When a check is required. Gates rather than one \"must pass\" flag because demanding every check at every step is how the step gets skipped. `revalidation` is the gate spec-suite drives after a structural replay (plan §7).",
+  "x-generated-from": "src/validation.mjs VALIDATION_GATES",
+  "type": "string",
+  "enum": [
+    "handoff",
+    "revalidation",
+    "integration",
+    "merge"
+  ]
+}

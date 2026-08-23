@@ -57,9 +57,10 @@
           "items": { "$ref": "finding.schema.json" }
         },
         "validationEvidence": {
-          "description": "Ids of validation evidence the reviewer relied on. Present so that an approval says what it was standing on; it does not substitute for running the checks, and an empty list is an honest statement that the judgement was by inspection alone.",
+          "description": "Ids of validation evidence the reviewer relied on. Present so that an approval says what it was standing on; it does not substitute for running the checks, and an empty list is an honest statement that the judgement was by inspection alone. Ids rather than free text, because the ledger follows every one of them: a citation of \"npm test\" cannot be resolved to a run, and one naming a run against a different candidate is confidence in work nobody looked at. Unique, because one run cited twice would read as two.",
           "type": "array",
-          "items": { "type": "string", "minLength": 1 }
+          "uniqueItems": true,
+          "items": { "$ref": "id.schema.json" }
         },
         "summary": {
           "description": "The judgement in the reviewer's words. Capped: this is the field a review transcript would land in, and the recipient needs the decision, not the deliberation.",
