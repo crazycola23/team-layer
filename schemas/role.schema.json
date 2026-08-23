@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/crazycola23/team-layer/schemas/role.schema.json",
+  "title": "Team role",
+  "description": "Every role enum in this repository resolves here. Edit roles/registry.json instead.",
+  "x-generated-from": "roles/registry.json@sha256:098a6756a2b9264673d83002de8063c9960b79ca13e46d9f1818cfa8f2f34416",
+  "type": "string",
+  "enum": [
+    "fullstack",
+    "product-architect",
+    "reviewer"
+  ]
+}

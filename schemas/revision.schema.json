@@ -1,0 +1,8 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/crazycola23/team-layer/schemas/revision.schema.json",
+  "title": "Semantic input revision",
+  "description": "An opaque scheme-prefixed revision token. The scheme names who can interpret the value (sha256, git, ...); assertRevision in src/digest.mjs applies stricter shape rules to known schemes.",
+  "type": "string",
+  "pattern": "^[a-z][a-z0-9-]*:[A-Za-z0-9._-]+$"
+}

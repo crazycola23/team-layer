@@ -1,0 +1,8 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/crazycola23/team-layer/schemas/digest.schema.json",
+  "title": "Content digest",
+  "description": "Lowercase sha256 hex with an explicit algorithm prefix, matching spec-suite's jsonDigest/contentDigest output.",
+  "type": "string",
+  "pattern": "^sha256:[0-9a-f]{64}$"
+}

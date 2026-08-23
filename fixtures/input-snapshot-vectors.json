@@ -1,0 +1,194 @@
+{
+  "schemaVersion": 1,
+  "algorithm": "sha256 over the compact canonical JSON of {\"inputs\":[{\"id\",\"revision\"},...]} sorted by id",
+  "x-generated-from": "scripts/gen-derived.mjs",
+  "valid": [
+    {
+      "name": "empty input set",
+      "note": "A task that genuinely depends on nothing still has a stable digest.",
+      "inputs": [],
+      "digest": "sha256:62b512d8c76bbed3048fc81bd94bd2aeaab2de4d3b36edbed2f3d3dd8ff3e33e"
+    },
+    {
+      "name": "single input",
+      "inputs": [
+        {
+          "id": "contract:coupon-api",
+          "revision": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+        }
+      ],
+      "digest": "sha256:96bb2c803c2a3be255b24b3831ef5da6d0b95dfab1ceccfb54350663e06575b0"
+    },
+    {
+      "name": "declaration order does not matter",
+      "note": "Same digest as \"declaration order does not matter (reversed)\".",
+      "inputs": [
+        {
+          "id": "contract:coupon-api",
+          "revision": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        {
+          "id": "brief:coupon",
+          "revision": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+        }
+      ],
+      "digest": "sha256:4471978bc1ceecd5e13a0ab95f156a79acb7cc30637f0cad34fc84b45089de39"
+    },
+    {
+      "name": "declaration order does not matter (reversed)",
+      "inputs": [
+        {
+          "id": "brief:coupon",
+          "revision": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+        },
+        {
+          "id": "contract:coupon-api",
+          "revision": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+        }
+      ],
+      "digest": "sha256:4471978bc1ceecd5e13a0ab95f156a79acb7cc30637f0cad34fc84b45089de39"
+    },
+    {
+      "name": "revision change moves the digest",
+      "note": "Same ids as \"single input\" with one revision bumped.",
+      "inputs": [
+        {
+          "id": "contract:coupon-api",
+          "revision": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+        }
+      ],
+      "digest": "sha256:2d515472f72bca66ebf190c23b9482b443b736d3a4b5fea6941232d4c3858860"
+    },
+    {
+      "name": "authority is not hashed",
+      "note": "Same digest as \"single input\": relabelling the source of a revision must not restate the task.",
+      "inputs": [
+        {
+          "id": "contract:coupon-api",
+          "revision": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+          "authority": "spec-suite"
+        }
+      ],
+      "digest": "sha256:96bb2c803c2a3be255b24b3831ef5da6d0b95dfab1ceccfb54350663e06575b0"
+    },
+    {
+      "name": "punctuation sorts by code unit, not locale",
+      "note": "Locale-aware collation often ignores \"-\"; sorting must use code-unit order so \"a-b\" precedes \"ab\".",
+      "inputs": [
+        {
+          "id": "ab",
+          "revision": "git:abc1234"
+        },
+        {
+          "id": "a-b",
+          "revision": "git:abc1234"
+        }
+      ],
+      "digest": "sha256:baed98061f56a7ab69d09c7c4a93555200c024c3084163d890f0b26c98e70f3d"
+    },
+    {
+      "name": "non-ascii ids are not escaped before hashing",
+      "inputs": [
+        {
+          "id": "contract:优惠券",
+          "revision": "sha256:4444444444444444444444444444444444444444444444444444444444444444"
+        }
+      ],
+      "digest": "sha256:514cd4b4d224b774464c3d252b25e621c3055be6e6bc527e91114dbe5340d96c"
+    },
+    {
+      "name": "mixed revision schemes",
+      "inputs": [
+        {
+          "id": "brief:coupon",
+          "revision": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+        },
+        {
+          "id": "baseline",
+          "revision": "git:0f041fd"
+        }
+      ],
+      "digest": "sha256:5d294c65815ba585c26fb8e37a6692ae7595657c5c7894a523268e5230fc0126"
+    }
+  ],
+  "invalid": [
+    {
+      "name": "duplicate id",
+      "inputs": [
+        {
+          "id": "a",
+          "revision": "git:abc1234"
+        },
+        {
+          "id": "a",
+          "revision": "git:abc1234"
+        }
+      ],
+      "code": "DUPLICATE_INPUT"
+    },
+    {
+      "name": "malformed revision",
+      "inputs": [
+        {
+          "id": "a",
+          "revision": "not-a-revision"
+        }
+      ],
+      "code": "MALFORMED_REVISION"
+    },
+    {
+      "name": "sha256 revision of the wrong length",
+      "inputs": [
+        {
+          "id": "a",
+          "revision": "sha256:abcd"
+        }
+      ],
+      "code": "MALFORMED_REVISION"
+    },
+    {
+      "name": "missing revision",
+      "inputs": [
+        {
+          "id": "a"
+        }
+      ],
+      "code": "MALFORMED_REVISION"
+    },
+    {
+      "name": "empty id",
+      "inputs": [
+        {
+          "id": "",
+          "revision": "git:abc1234"
+        }
+      ],
+      "code": "MALFORMED_INPUTS"
+    },
+    {
+      "name": "padded id",
+      "inputs": [
+        {
+          "id": " a ",
+          "revision": "git:abc1234"
+        }
+      ],
+      "code": "MALFORMED_INPUTS"
+    },
+    {
+      "name": "entry is not an object",
+      "inputs": [
+        "contract:coupon-api"
+      ],
+      "code": "MALFORMED_INPUTS"
+    },
+    {
+      "name": "input set is not an array",
+      "inputs": {
+        "id": "a",
+        "revision": "git:abc1234"
+      },
+      "code": "MALFORMED_INPUTS"
+    }
+  ]
+}

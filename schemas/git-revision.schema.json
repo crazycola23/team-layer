@@ -1,0 +1,8 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/crazycola23/team-layer/schemas/git-revision.schema.json",
+  "title": "Git revision",
+  "description": "An immutable Git object id. Matches spec-suite's REVISION_RE in control-plane-concurrency.mjs; a branch name or tag is not a revision.",
+  "type": "string",
+  "pattern": "^git:[0-9a-fA-F]{7,64}$"
+}

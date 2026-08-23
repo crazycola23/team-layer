@@ -3,7 +3,7 @@
   "findingId": "FIND-001",
   "severity": "major",
   "status": "open",
-  "candidateRevision": "git:replace-me",
+  "candidateRevision": "git:0000000000000000000000000000000000000000",
   "requirement": "AC-1",
   "location": "src/example.ts:42",
   "evidence": "Observed behavior or code/test evidence",

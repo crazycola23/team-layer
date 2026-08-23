@@ -8,11 +8,11 @@
   "properties": {
     "schemaVersion": {"const": 1},
     "agentId": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{2,63}$"},
-    "role": {"enum": ["product-architect", "fullstack", "reviewer"]},
+    "role": {"$ref": "role.schema.json"},
     "roleVersion": {"type": "string", "minLength": 1},
     "skill": {"const": "persistent-agent-team"},
     "skillVersion": {"type": "string", "minLength": 1},
-    "createdAt": {"type": "string", "format": "date-time"},
-    "updatedAt": {"type": "string", "format": "date-time"}
+    "createdAt": {"$ref": "timestamp.schema.json"},
+    "updatedAt": {"$ref": "timestamp.schema.json"}
   }
 }

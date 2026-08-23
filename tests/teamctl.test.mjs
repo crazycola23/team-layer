@@ -9,6 +9,21 @@ import { fileURLToPath } from 'node:url';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CLI = path.join(ROOT, 'scripts', 'teamctl.mjs');
 
+/**
+ * Windows has no POSIX permission bits, so an executable-bit assertion cannot
+ * pass there. Skipping silently would mean the check has never actually run
+ * anywhere, so CI sets TEAM_LAYER_REQUIRE_POSIX=1 to turn the missing
+ * capability into a hard failure instead of a quiet pass.
+ */
+function hasCapability(t, name, available) {
+  if (available) return true;
+  if (process.env.TEAM_LAYER_REQUIRE_POSIX === '1') {
+    assert.fail(`capability ${name} is unavailable, but TEAM_LAYER_REQUIRE_POSIX=1 requires it`);
+  }
+  t.diagnostic(`skipped assertion: ${name} unavailable on ${process.platform}`);
+  return false;
+}
+
 function git(args, cwd) {
   return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
 }
@@ -50,7 +65,9 @@ test('Claude setup creates harness-neutral identity and local adapter idempotent
   assert.equal('taskId' in identity, false);
 
   const adapter = path.join(f.repo, 'CLAUDE.local.md');
-  assert.match(fs.readFileSync(adapter, 'utf8'), /product-01\/bootstrap\.md/);
+  // The adapter embeds a native absolute path, so compare with separators normalized
+  // rather than asserting POSIX slashes that Windows will never emit.
+  assert.match(fs.readFileSync(adapter, 'utf8').replaceAll('\\', '/'), /product-01\/bootstrap\.md/);
   assert.equal(git(['status', '--porcelain'], f.repo), '');
 
   fs.appendFileSync(adapter, '\n# personal local note\n');
@@ -87,7 +104,7 @@ test('setup refuses silent role reassignment', () => {
   assert.match(res.stderr, /role reassignment must be explicit/);
 });
 
-test('Gemini setup preserves project GEMINI.md and emits agent-specific launcher', () => {
+test('Gemini setup preserves project GEMINI.md and emits agent-specific launcher', (t) => {
   const f = fixture();
   fs.writeFileSync(path.join(f.repo, 'GEMINI.md'), '# tracked project instructions\n');
   git(['add', 'GEMINI.md'], f.repo);
@@ -101,7 +118,9 @@ test('Gemini setup preserves project GEMINI.md and emits agent-specific launcher
   assert.deepEqual(settings.context.fileName, ['GEMINI.md', 'AGENT.bootstrap.md']);
   const launcher = path.join(f.home, 'agents', 'reviewer-01', 'launch-gemini.sh');
   assert.ok(fs.existsSync(launcher));
-  assert.ok((fs.statSync(launcher).mode & 0o111) !== 0);
+  if (hasCapability(t, 'posix-executable-bit', process.platform !== 'win32')) {
+    assert.ok((fs.statSync(launcher).mode & 0o111) !== 0, 'launcher must be executable');
+  }
   assert.equal(git(['status', '--porcelain'], f.repo), '');
 });
 

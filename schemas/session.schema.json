@@ -1,5 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/crazycola23/team-layer/schemas/session.schema.json",
   "title": "Team Session",
   "type": "object",
   "additionalProperties": false,
@@ -9,7 +10,7 @@
     "sessionId": {"type": "string", "minLength": 1},
     "status": {"enum": ["forming", "product-definition", "implementation", "review", "integration", "completed", "blocked", "cancelled"]},
     "integrationTarget": {"type": "string", "minLength": 1},
-    "createdAt": {"type": "string", "format": "date-time"},
+    "createdAt": {"$ref": "timestamp.schema.json"},
     "canonicalProvider": {"type": "string"},
     "notes": {"type": "string"}
   }

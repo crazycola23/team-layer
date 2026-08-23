@@ -5,11 +5,12 @@ import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
+import { roleIds, isRole, roleFile, roleVersion } from '../src/roles.mjs';
+
 const __filename = fileURLToPath(import.meta.url);
 const SCRIPT_DIR = path.dirname(__filename);
 const SKILL_ROOT = path.resolve(SCRIPT_DIR, '..');
 const SKILL_NAME = 'persistent-agent-team';
-const ROLES = new Set(['product-architect', 'fullstack', 'reviewer']);
 const MANAGED_START = '<!-- persistent-agent-team:managed:start -->';
 const MANAGED_END = '<!-- persistent-agent-team:managed:end -->';
 
@@ -81,15 +82,20 @@ function skillVersion() {
   return readText(path.join(SKILL_ROOT, 'VERSION')).trim();
 }
 
-function roleFile(role) {
-  return path.join(SKILL_ROOT, 'roles', `${role}.md`);
+function roleFileOrDie(role) {
+  try {
+    return roleFile(role);
+  } catch (error) {
+    die(error.message);
+  }
 }
 
-function roleVersion(role) {
-  const text = readText(roleFile(role));
-  const match = text.match(/^version:\s*([^\s]+)\s*$/m);
-  if (!match) die(`role ${role} has no version frontmatter`);
-  return match[1];
+function roleVersionOrDie(role) {
+  try {
+    return roleVersion(role);
+  } catch (error) {
+    die(error.message);
+  }
 }
 
 function assertAgentId(id) {
@@ -99,7 +105,7 @@ function assertAgentId(id) {
 }
 
 function assertRole(role) {
-  if (!ROLES.has(role)) die(`unsupported role ${JSON.stringify(role)}; expected ${[...ROLES].join(', ')}`);
+  if (!isRole(role)) die(`unsupported role ${JSON.stringify(role)}; expected ${roleIds().join(', ')}`);
 }
 
 function git(args, cwd) {
@@ -159,7 +165,7 @@ function shellQuote(value) {
 }
 
 function bootstrapText(identity) {
-  const rolePath = roleFile(identity.role);
+  const rolePath = roleFileOrDie(identity.role);
   const corePath = path.join(SKILL_ROOT, 'protocol', 'core.md');
   const recoveryPath = path.join(SKILL_ROOT, 'protocol', 'recovery.md');
   const collaborationPath = path.join(SKILL_ROOT, 'protocol', 'collaboration.md');
@@ -191,7 +197,7 @@ function createOrRefreshIdentity(agentId, role) {
   assertRole(role);
   const paths = identityPaths(agentId);
   const now = new Date().toISOString();
-  const currentRoleVersion = roleVersion(role);
+  const currentRoleVersion = roleVersionOrDie(role);
   const currentSkillVersion = skillVersion();
   let createdAt = now;
   if (fs.existsSync(paths.identity)) {
@@ -339,9 +345,9 @@ function doctor(args) {
         try {
           const identity = readJson(binding.identityPath);
           check('identity-agent', identity.agentId === binding.agentId, `identity=${identity.agentId}, binding=${binding.agentId}`);
-          check('identity-role', ROLES.has(identity.role), identity.role);
-          if (ROLES.has(identity.role)) {
-            const expectedRoleVersion = roleVersion(identity.role);
+          check('identity-role', isRole(identity.role), identity.role);
+          if (isRole(identity.role)) {
+            const expectedRoleVersion = roleVersionOrDie(identity.role);
             check('role-version', identity.roleVersion === expectedRoleVersion, `installed=${identity.roleVersion}, current=${expectedRoleVersion}`);
           }
           check('skill-version', identity.skillVersion === skillVersion(), `installed=${identity.skillVersion}, current=${skillVersion()}`);
@@ -372,7 +378,7 @@ function show(args) {
 function usage() {
   console.log(`Persistent Agent Team helper\n\n` +
     `Commands:\n` +
-    `  setup  --agent-id <id> --role <product-architect|fullstack|reviewer> --harness <claude-code|codex|gemini-cli|generic> [--repo .] [--force]\n` +
+    `  setup  --agent-id <id> --role <${roleIds().join('|')}> --harness <claude-code|codex|gemini-cli|generic> [--repo .] [--force]\n` +
     `  doctor [--repo .]\n` +
     `  show   [--repo .]\n\n` +
     `Environment:\n` +

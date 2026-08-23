@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "roles": [
+    { "id": "product-architect", "file": "roles/product-architect.md" },
+    { "id": "fullstack", "file": "roles/fullstack.md" },
+    { "id": "reviewer", "file": "roles/reviewer.md" }
+  ]
+}

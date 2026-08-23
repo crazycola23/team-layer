@@ -1,0 +1,8 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/crazycola23/team-layer/schemas/timestamp.schema.json",
+  "title": "UTC timestamp",
+  "description": "ISO 8601 in UTC, as produced by Date#toISOString. Local offsets are rejected so that two artifacts written on different machines are directly comparable as strings.",
+  "type": "string",
+  "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$"
+}

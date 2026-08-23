@@ -1,5 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/crazycola23/team-layer/schemas/finding.schema.json",
   "title": "Reviewer Finding",
   "type": "object",
   "additionalProperties": false,
@@ -9,7 +10,7 @@
     "findingId": {"type": "string", "minLength": 1},
     "severity": {"enum": ["blocker", "major", "minor", "note"]},
     "status": {"enum": ["open", "fixed", "verified", "closed", "rejected-with-evidence", "accepted-risk", "unresolved-product"]},
-    "candidateRevision": {"type": "string", "pattern": "^git:[0-9a-fA-F]{7,64}$"},
+    "candidateRevision": {"$ref": "git-revision.schema.json"},
     "requirement": {"type": "string", "minLength": 1},
     "location": {"type": "string", "minLength": 1},
     "evidence": {"type": "string", "minLength": 1},
