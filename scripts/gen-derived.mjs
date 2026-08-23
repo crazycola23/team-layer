@@ -12,7 +12,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { inputSnapshotDigest, DigestError } from '../src/digest.mjs';
+import { inputSnapshotDigest, DigestError, REVISION_PATTERN, DIGEST_PATTERN, GIT_REVISION_PATTERN } from '../src/digest.mjs';
 import { SKILL_ROOT, roleIds, registryDigest } from '../src/roles.mjs';
 
 const check = process.argv.includes('--check');
@@ -41,6 +41,39 @@ emit('schemas/role.schema.json', {
   'x-generated-from': `roles/registry.json@${registryDigest()}`,
   type: 'string',
   enum: roleIds(),
+});
+
+// -------------------------------------------------------------- revision schema
+// Generated so a revision can never pass its schema and then fail closed inside
+// `assertRevision`: both sides are the same pattern.
+emit('schemas/revision.schema.json', {
+  $schema: 'https://json-schema.org/draft/2020-12/schema',
+  $id: 'https://github.com/crazycola23/team-layer/schemas/revision.schema.json',
+  title: 'Semantic input revision',
+  description: 'An opaque scheme-prefixed revision token. The scheme names who can interpret the value; known schemes (sha256, git) additionally have their shape enforced.',
+  'x-generated-from': 'src/digest.mjs REVISION_PATTERN',
+  type: 'string',
+  pattern: REVISION_PATTERN,
+});
+
+emit('schemas/digest.schema.json', {
+  $schema: 'https://json-schema.org/draft/2020-12/schema',
+  $id: 'https://github.com/crazycola23/team-layer/schemas/digest.schema.json',
+  title: 'Content digest',
+  description: 'A sha256 content digest as produced by contentDigest/jsonDigest in src/digest.mjs.',
+  'x-generated-from': 'src/digest.mjs DIGEST_PATTERN',
+  type: 'string',
+  pattern: DIGEST_PATTERN,
+});
+
+emit('schemas/git-revision.schema.json', {
+  $schema: 'https://json-schema.org/draft/2020-12/schema',
+  $id: 'https://github.com/crazycola23/team-layer/schemas/git-revision.schema.json',
+  title: 'Git revision',
+  description: "A Git object name. Matches spec-suite's REVISION_RE so both layers agree on which strings name a commit.",
+  'x-generated-from': 'src/digest.mjs GIT_REVISION_PATTERN',
+  type: 'string',
+  pattern: GIT_REVISION_PATTERN,
 });
 
 // -------------------------------------------------- input snapshot test vectors

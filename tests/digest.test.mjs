@@ -12,6 +12,9 @@ import {
   jsonDigest,
   normalizeInputs,
   inputSnapshotDigest,
+  REVISION_PATTERN,
+  DIGEST_PATTERN,
+  GIT_REVISION_PATTERN,
   DigestError,
 } from '../src/digest.mjs';
 
@@ -130,4 +133,81 @@ test('adding an input restates the task even when existing revisions are unchang
   const one = [{ id: 'contract:x', revision: 'git:aaaaaaa' }];
   const two = [...one, { id: 'brief:y', revision: 'git:bbbbbbb' }];
   assert.notEqual(inputSnapshotDigest(one), inputSnapshotDigest(two));
+});
+
+// The generated schemas are the *only* thing standing between a malformed
+// revision and a fail-closed error thrown much later, at digest time. If the
+// pattern were even slightly wider than assertRevision, an artifact could pass
+// validation and then blow up in a place that no longer knows which field was
+// at fault.
+test('the generated revision pattern accepts exactly what assertRevision accepts', () => {
+  const cases = [
+    'sha256:0000000000000000000000000000000000000000000000000000000000000000',
+    'git:abc1234',
+    'git:ABCDEF0',
+    'contract-rev:v1.2.3_final',
+    'x:1',
+    'sha256:abcd',
+    'sha256:' + '0'.repeat(63),
+    'sha256:' + '0'.repeat(65),
+    'sha256:' + 'A'.repeat(64),
+    'git:abc',
+    'git:' + 'a'.repeat(65),
+    'git:xyz1234',
+    'Sha256:0',
+    'no-scheme',
+    ':leading',
+    '1abc:x',
+    'a:',
+    'a b:c',
+    'a:b c',
+  ];
+  const pattern = new RegExp(REVISION_PATTERN);
+  for (const value of cases) {
+    let accepted = true;
+    try {
+      assertRevision(value);
+    } catch (error) {
+      if (!(error instanceof DigestError)) throw error;
+      accepted = false;
+    }
+    assert.equal(pattern.test(value), accepted, `${JSON.stringify(value)}: schema and assertRevision disagree`);
+  }
+
+  // Every checked-in schema that constrains a revision must use these patterns
+  // rather than restating them.
+  const schemaDir = path.join(ROOT, 'schemas');
+  const expected = {
+    'revision.schema.json': REVISION_PATTERN,
+    'digest.schema.json': DIGEST_PATTERN,
+    'git-revision.schema.json': GIT_REVISION_PATTERN,
+  };
+  for (const [name, want] of Object.entries(expected)) {
+    const schema = JSON.parse(fs.readFileSync(path.join(schemaDir, name), 'utf8'));
+    assert.equal(schema.pattern, want, `${name} must be regenerated from src/digest.mjs`);
+  }
+  for (const name of fs.readdirSync(schemaDir)) {
+    if (name in expected) continue;
+    const body = fs.readFileSync(path.join(schemaDir, name), 'utf8');
+    assert.ok(!/\[0-9a-fA-?F\]\{7,64\}/.test(body), `${name} restates a git revision pattern; $ref git-revision.schema.json`);
+    assert.ok(!/\[0-9a-f\]\{64\}/.test(body), `${name} restates a sha256 pattern; $ref digest.schema.json`);
+  }
+});
+
+test('every revision in a checked-in template survives assertRevision', () => {
+  const dir = path.join(ROOT, 'templates');
+  for (const name of fs.readdirSync(dir).filter((f) => f.endsWith('.json'))) {
+    const body = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8'));
+    const walk = (value, at) => {
+      if (Array.isArray(value)) return value.forEach((item, i) => walk(item, `${at}[${i}]`));
+      if (!value || typeof value !== 'object') return;
+      for (const [key, child] of Object.entries(value)) {
+        if (typeof child === 'string' && /Revision$|^revision$/.test(key)) {
+          assert.doesNotThrow(() => assertRevision(child, `${name} ${at}.${key}`));
+        }
+        walk(child, `${at}.${key}`);
+      }
+    };
+    walk(body, '$');
+  }
 });

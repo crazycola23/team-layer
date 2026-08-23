@@ -5,15 +5,25 @@
   "subject": "agent:fullstack-01",
   "role": "fullstack",
   "baseRevision": "git:0123456",
-  "readSet": ["src/**", "tests/**"],
-  "writeSet": ["src/**", "tests/**"],
+  "readSet": [
+    "src/**",
+    "tests/**"
+  ],
+  "writeSet": [
+    "src/**",
+    "tests/**"
+  ],
   "inputs": [
     {
       "id": "contract:example-api",
-      "revision": "sha256:replace-me",
+      "revision": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
       "authority": "spec-suite"
     }
   ],
-  "acceptance": ["AC-1"],
-  "validation": ["npm test"]
+  "acceptance": [
+    "AC-1"
+  ],
+  "validation": [
+    "npm test"
+  ]
 }

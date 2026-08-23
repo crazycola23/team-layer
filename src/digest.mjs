@@ -68,11 +68,43 @@ export function jsonDigest(value) {
   return contentDigest(stableJson(value));
 }
 
-const REVISION = /^[a-z][a-z0-9-]*:[A-Za-z0-9._-]+$/;
-const KNOWN_REVISION_SHAPES = {
-  sha256: /^[0-9a-f]{64}$/,
-  git: /^[0-9a-fA-F]{7,64}$/,
+const GENERIC_REVISION_SOURCE = '[a-z][a-z0-9-]*:[A-Za-z0-9._-]+';
+const KNOWN_REVISION_SOURCES = {
+  sha256: '[0-9a-f]{64}',
+  git: '[0-9a-fA-F]{7,64}',
 };
+
+const REVISION = new RegExp(`^${GENERIC_REVISION_SOURCE}$`);
+const KNOWN_REVISION_SHAPES = Object.fromEntries(
+  Object.entries(KNOWN_REVISION_SOURCES).map(([scheme, source]) => [scheme, new RegExp(`^${source}$`)]),
+);
+
+/**
+ * The single pattern that accepts exactly what `assertRevision` accepts.
+ *
+ * `schemas/revision.schema.json` is generated from this by
+ * `scripts/gen-derived.mjs`, because a schema that accepts a token the code
+ * then rejects is the same silent under-validation `src/schema.mjs` exists to
+ * prevent: the artifact would pass its schema and fail closed later, at digest
+ * time, far from the field that caused it.
+ *
+ * The negative lookahead is what makes it exact — without it a malformed
+ * `sha256:` token would fall through to the permissive generic branch.
+ */
+export const REVISION_PATTERN = `^(?:${
+  Object.entries(KNOWN_REVISION_SOURCES).map(([scheme, source]) => `${scheme}:${source}`).join('|')
+}|(?!(?:${Object.keys(KNOWN_REVISION_SOURCES).join('|')}):)${GENERIC_REVISION_SOURCE})$`;
+
+/** `sha256:<64 hex>` — the shape every digest in this repository takes. */
+export const DIGEST_PATTERN = `^sha256:${KNOWN_REVISION_SOURCES.sha256}$`;
+
+/**
+ * `git:<7-64 hex>` — a Git object name.
+ *
+ * Deliberately identical to spec-suite's `REVISION_RE`, so the two layers agree
+ * on which strings name a commit.
+ */
+export const GIT_REVISION_PATTERN = `^git:${KNOWN_REVISION_SOURCES.git}$`;
 
 /** Validate a revision token: `<scheme>:<opaque>`, with extra rigor for known schemes. */
 export function assertRevision(revision, label = 'revision') {

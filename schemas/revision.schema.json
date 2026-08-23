@@ -2,7 +2,8 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/crazycola23/team-layer/schemas/revision.schema.json",
   "title": "Semantic input revision",
-  "description": "An opaque scheme-prefixed revision token. The scheme names who can interpret the value (sha256, git, ...); assertRevision in src/digest.mjs applies stricter shape rules to known schemes.",
+  "description": "An opaque scheme-prefixed revision token. The scheme names who can interpret the value; known schemes (sha256, git) additionally have their shape enforced.",
+  "x-generated-from": "src/digest.mjs REVISION_PATTERN",
   "type": "string",
-  "pattern": "^[a-z][a-z0-9-]*:[A-Za-z0-9._-]+$"
+  "pattern": "^(?:sha256:[0-9a-f]{64}|git:[0-9a-fA-F]{7,64}|(?!(?:sha256|git):)[a-z][a-z0-9-]*:[A-Za-z0-9._-]+)$"
 }
