@@ -42,10 +42,17 @@ function fixture() {
   return { dir, repo, home };
 }
 
-function run(args, { repo, home }, expect = 0) {
+/**
+ * `env` overlays the inherited environment, and an empty string un-sets a variable.
+ *
+ * Needed because `SPEC_SUITE_ROOT` is a real variable an operator may have exported: a test
+ * asserting what happens when nobody named a spec-suite would otherwise pass or fail
+ * depending on the machine it ran on.
+ */
+function run(args, { repo, home, env = {} }, expect = 0) {
   const res = spawnSync(process.execPath, [CLI, ...args], {
     cwd: repo,
-    env: { ...process.env, AGENT_TEAM_HOME: home },
+    env: { ...process.env, AGENT_TEAM_HOME: home, ...env },
     encoding: 'utf8',
   });
   assert.equal(res.status, expect, `stdout=${res.stdout}\nstderr=${res.stderr}`);
@@ -862,3 +869,167 @@ test('the CLI refuses evidence and citations that would misdescribe what ran', (
     { code: 'REVIEW_EVIDENCE_MISMATCH', exit: 3 });
 });
 
+// --------------------------------------------------------------- spec-suite handoff
+// tests/spec-suite.test.mjs owns detection and projection semantics. What is left to
+// the CLI is the part only it decides: which spec-suite location it looked at, whether
+// a wrong answer there is a health finding, and what lands in a file that spec-suite
+// will read without complaining about anything it does not recognise.
+
+/** A minimal install that answers the probe: the concurrency contract, and nothing else. */
+function fakeSpecSuite(f, { name = 'spec-suite', keeps = ['baseRevision', 'readSet', 'writeSet', 'subject', 'role'] } = {}) {
+  const root = path.join(f.dir, name);
+  fs.mkdirSync(path.join(root, 'scripts'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'scripts', 'control-plane-concurrency.mjs'),
+    'export function projectionConcurrencyFields(task) {\n'
+    + `  const keeps = ${JSON.stringify(keeps)};\n`
+    + '  const out = {};\n'
+    + '  for (const k of keeps) out[k] = task[k];\n'
+    + '  return out;\n}\n');
+  return root;
+}
+
+const noSpecSuiteEnv = { SPEC_SUITE_ROOT: '' };
+
+/**
+ * A repository without spec-suite is not a sick repository.
+ *
+ * Most are not using it, and a doctor that reported unhealthy for the ordinary case would
+ * teach its readers that exit 2 means nothing. The section still appears, because "there is
+ * no spec-suite here" is the answer to the question that was asked.
+ */
+test('doctor reports an absent spec-suite without calling the worktree unhealthy', () => {
+  const f = bootstrapped();
+  const out = JSON.parse(run(['doctor', '--repo', '.', '--with-spec-suite'], { ...f, env: noSpecSuiteEnv }).stdout);
+  assert.equal(out.status, 'healthy');
+  assert.equal(out.specSuite.source, 'probed');
+  assert.equal(out.specSuite.compatibilityMode, 'partial');
+  assert.deepEqual(out.specSuite.unsupported.sort(),
+    ['mergeGate', 'multiAgentConcurrency', 'semanticValidator', 'structuralRevalidation']);
+  // Not `unsupported`: the module that would have answered it is the one that is missing.
+  assert.deepEqual(out.specSuite.unknown, ['semanticInputs']);
+  assert.equal(out.specSuite.projectableFields.discovered, false);
+});
+
+/**
+ * Asserting a location is a claim, and a false claim is what doctor is for.
+ *
+ * The asymmetry with the test above is deliberate. Nobody said there was a spec-suite in
+ * the default case; here somebody did, by typing a path — and a typo in that path would
+ * otherwise produce a full run whose every capability read `unknown` for a reason that had
+ * nothing to do with spec-suite.
+ */
+test('a spec-suite path that was asserted and is not there is a health finding', () => {
+  const f = bootstrapped();
+  const missing = path.join(f.dir, 'not-installed-here');
+  for (const [name, args, env] of [
+    ['named on the command line', ['--spec-suite', missing], noSpecSuiteEnv],
+    ['named in the environment', [], { SPEC_SUITE_ROOT: missing }],
+  ]) {
+    const res = run(['doctor', '--repo', '.', '--with-spec-suite', ...args], { ...f, env }, 2);
+    const out = JSON.parse(res.stdout);
+    assert.equal(out.status, 'unhealthy', name);
+    const finding = out.checks.find((c) => c.name === 'spec-suite-root');
+    assert.equal(finding.ok, false, name);
+    assert.match(finding.detail, /does not exist/, name);
+    // And the capabilities read unknown rather than unsupported, because nothing was looked at.
+    assert.equal(out.specSuite.source, 'unavailable', name);
+    assert.equal(out.specSuite.unsupported.length, 0, name);
+  }
+});
+
+test('doctor reports what a real install demonstrated, and stays healthy about the rest', () => {
+  const f = bootstrapped();
+  const root = fakeSpecSuite(f);
+  const out = JSON.parse(run(['doctor', '--repo', '.', '--with-spec-suite', '--spec-suite', root],
+    { ...f, env: noSpecSuiteEnv }).stdout);
+  assert.equal(out.status, 'healthy');
+  assert.equal(out.specSuite.capabilities.multiAgentConcurrency.support, 'supported');
+  assert.equal(out.specSuite.capabilities.semanticInputs.support, 'unsupported');
+  assert.equal(out.specSuite.projectableFields.discovered, true);
+  // No handshake, so no versions — and doctor says so rather than leaving the reader to
+  // notice five nulls.
+  assert.equal(out.specSuite.protocolVersion, null);
+  assert.ok(out.specSuite.notes.some((n) => /probed, not declared/.test(n)));
+});
+
+/**
+ * The projection comes from the frozen packet, not from the file it was issued with.
+ *
+ * The plan sketches `project-spec-task --task task.json`, and a file is the wrong source:
+ * it is editable, so the spec-suite task could describe work no team task authorised. This
+ * proves the substitution — the packet on disk is rewritten between issue and projection,
+ * and the projection ignores it.
+ */
+test('project-spec-task projects the frozen packet and reports what stayed behind', () => {
+  const f = bootstrapped();
+  const env = { SPEC_SUITE_ROOT: fakeSpecSuite(f) };
+  run(['session', 'start', '--session', 'feature:coupon', '--target', 'main'], f);
+  writePacket(f, taskPacket());
+  run(['task', 'issue', '--packet', 'packet.json'], f);
+  writePacket(f, taskPacket({ writeSet: ['src/**', '.github/**'] }));
+
+  const out = JSON.parse(run(['project-spec-task', '--session', 'feature:coupon',
+    '--task', 'task:coupon-api'], { ...f, env }).stdout);
+  assert.deepEqual(out.projection.writeSet, ['src/coupon/**'], 'the edited file must not be the source');
+  assert.deepEqual(out.projected, ['baseRevision', 'readSet', 'role', 'subject', 'writeSet']);
+  assert.equal(out.generation, 1);
+  assert.match(out.frozenDigest, /^sha256:[0-9a-f]{64}$/);
+  assert.equal(out.capabilitySource, 'probed');
+
+  // §17 Scenario 2's accepted cost, said out loud at the moment it starts applying.
+  assert.equal(out.compatibility.mode, 'degraded');
+  const inputs = out.withheld.find((w) => w.field === 'inputs');
+  assert.deepEqual([inputs.reason, inputs.capability], ['capability-unsupported', 'semanticInputs']);
+  assert.equal(out.withheld.find((w) => w.field === 'validationPlan').reason, 'team-layer-owned');
+});
+
+/**
+ * A file spec-suite reads must contain nothing spec-suite does not read.
+ *
+ * This is the one place the silent-acceptance hazard becomes a file on disk: were the
+ * compatibility report written alongside the projection, spec-suite's validator would accept
+ * it without a word and the extras would sit there looking authoritative forever.
+ */
+test('project-spec-task --output writes the projection alone', () => {
+  const f = bootstrapped();
+  const env = { SPEC_SUITE_ROOT: fakeSpecSuite(f) };
+  run(['session', 'start', '--session', 'feature:coupon', '--target', 'main'], f);
+  writePacket(f, taskPacket());
+  run(['task', 'issue', '--packet', 'packet.json'], f);
+
+  const out = JSON.parse(run(['project-spec-task', '--session', 'feature:coupon',
+    '--task', 'task:coupon-api', '--output', 'spec-task.json'], { ...f, env }).stdout);
+  const written = JSON.parse(fs.readFileSync(path.join(f.repo, 'spec-task.json'), 'utf8'));
+  assert.deepEqual(written, out.projection);
+  assert.deepEqual(Object.keys(written).sort(), out.projected);
+  for (const teamOnly of ['taskId', 'sessionId', 'compatibility', 'withheld', 'inputs', 'validationPlan', 'frozenDigest']) {
+    assert.equal(teamOnly in written, false, `${teamOnly} must not reach spec-suite`);
+  }
+  assert.equal(out.output, path.join(f.repo, 'spec-task.json'));
+});
+
+/**
+ * An install that carries semantic inputs gets them, and the same command stops warning.
+ *
+ * The compatibility mode has to be able to reach `full`, or it is decoration: a status that
+ * is always `degraded` tells a reader nothing about their install.
+ */
+test('project-spec-task carries semantic inputs to a far side that keeps them', () => {
+  const f = bootstrapped();
+  const env = {
+    SPEC_SUITE_ROOT: fakeSpecSuite(f, {
+      name: 'spec-suite-next',
+      keeps: ['baseRevision', 'readSet', 'writeSet', 'subject', 'role', 'inputs'],
+    }),
+  };
+  run(['session', 'start', '--session', 'feature:coupon', '--target', 'main'], f);
+  writePacket(f, taskPacket());
+  run(['task', 'issue', '--packet', 'packet.json'], f);
+
+  const out = JSON.parse(run(['project-spec-task', '--session', 'feature:coupon',
+    '--task', 'task:coupon-api'], { ...f, env }).stdout);
+  assert.equal(out.compatibility.mode, 'full');
+  assert.deepEqual(out.projection.inputs, taskPacket().inputs);
+  assert.equal(out.withheld.some((w) => w.field === 'inputs'), false);
+  assert.equal(out.compatibility.warnings.some((w) => /only enforced here/.test(w)), false);
+});

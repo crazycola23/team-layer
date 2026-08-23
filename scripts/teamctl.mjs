@@ -10,6 +10,7 @@ import { Ledger, LedgerError, SESSION_STATUSES, TASK_STATUSES, HANDOFF_ACTIONS, 
 import { SlugError } from '../src/slug.mjs';
 import { DigestError } from '../src/digest.mjs';
 import { runCommandCheck, checksRequiredAt, VALIDATION_GATES } from '../src/validation.mjs';
+import { detectCapabilities, projectSpecTask, SPEC_SUITE_CAPABILITIES } from '../src/spec-suite.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const SCRIPT_DIR = path.dirname(__filename);
@@ -365,9 +366,100 @@ function doctor(args) {
     }
   }
 
-  const ok = checks.every((x) => x.ok);
-  console.log(JSON.stringify({ status: ok ? 'healthy' : 'unhealthy', checks }, null, 2));
-  if (!ok) process.exit(2);
+  const report = { checks };
+  // The spec-suite section is built before health is decided, because asserting a location
+  // that does not exist is itself a finding and has to be able to add a failing check.
+  if (args['with-spec-suite']) report.specSuite = specSuiteSection(repo, args, check);
+  const healthy = checks.every((x) => x.ok);
+  console.log(JSON.stringify({ status: healthy ? 'healthy' : 'unhealthy', ...report }, null, 2));
+  if (!healthy) process.exit(2);
+}
+
+/**
+ * Where the installed spec-suite is, if anyone said.
+ *
+ * The repository root is the default because spec-suite is a skill installed *into* a
+ * project, not a service running beside it — so the common case is that the repo being
+ * worked in is the repo that has it.
+ */
+function specSuiteRoot(repo, args) {
+  if (typeof args['spec-suite'] === 'string' && args['spec-suite'] !== '') {
+    return { root: path.resolve(args['spec-suite']), asserted: true };
+  }
+  if (typeof process.env.SPEC_SUITE_ROOT === 'string' && process.env.SPEC_SUITE_ROOT !== '') {
+    return { root: path.resolve(process.env.SPEC_SUITE_ROOT), asserted: true };
+  }
+  return { root: repo.root, asserted: false };
+}
+
+/**
+ * What the far side can do, as a doctor section rather than a separate command.
+ *
+ * Health is only affected when the operator *asserted* a spec-suite location: passing
+ * `--spec-suite <path>` is a claim that the integration exists, and a claim that turns out
+ * to be false is exactly what doctor is for. An absent spec-suite at the default location
+ * is not a fault — most repositories do not use it — so it reports and stays healthy.
+ *
+ * Capabilities themselves never make doctor unhealthy. Every install lacking the handshake
+ * would fail, which would train the reader to ignore the exit code; `unknown` is a fact
+ * about what could be established, and the right response is compatibility mode, not alarm.
+ */
+function specSuiteSection(repo, args, check) {
+  const { root, asserted } = specSuiteRoot(repo, args);
+  if (asserted && !fs.existsSync(root)) {
+    check('spec-suite-root', false, `${root} was given with --spec-suite but does not exist`);
+  }
+  const detection = detectCapabilities({ root });
+  return {
+    ...detection,
+    // A flat roll-up, because the question a caller actually has is "may I rely on the far
+    // side for this", and answering it should not require reasoning over five objects.
+    unsupported: SPEC_SUITE_CAPABILITIES.filter((name) => detection.capabilities[name].support === 'unsupported'),
+    unknown: SPEC_SUITE_CAPABILITIES.filter((name) => detection.capabilities[name].support === 'unknown'),
+    compatibilityMode: SPEC_SUITE_CAPABILITIES.some((name) => detection.capabilities[name].support !== 'supported')
+      ? 'partial'
+      : 'full',
+  };
+}
+
+/**
+ * Hand a frozen task to spec-suite, and say what stayed behind.
+ *
+ * The packet comes from the ledger rather than a file path, unlike the plan's sketch: the
+ * frozen packet is the one under digest, and projecting a JSON file somebody edited would
+ * produce a spec-suite task that no team task corresponds to — which is the manual
+ * translation this command exists to replace, with an extra step.
+ */
+function projectSpecTaskCommand(args) {
+  const { repo, ledger } = ledgerFor(args);
+  runLedger(() => {
+    const sessionId = requireFlag(args, 'session');
+    const taskId = requireFlag(args, 'task');
+    const task = ledger.readTask(sessionId, taskId);
+    const { root } = specSuiteRoot(repo, args);
+    const detection = detectCapabilities({ root });
+    const projected = projectSpecTask(task.frozen, detection);
+    const result = {
+      sessionId,
+      taskId,
+      // The team-side identity of what was projected, so a spec-suite task can be traced
+      // back to the generation it came from. Not projected itself — spec-suite would accept
+      // it silently and nothing would read it.
+      generation: task.state.generation,
+      frozenDigest: task.frozenDigest,
+      specSuiteRoot: detection.root,
+      capabilitySource: detection.source,
+      ...projected,
+    };
+    if (typeof args.output === 'string' && args.output !== '') {
+      // Only the projection goes in the file. A spec-suite task file carrying this skill's
+      // compatibility report would be a file with two audiences, and the far side accepts
+      // unknown fields without complaint, so nothing would ever flag the extras.
+      writeJsonAtomic(path.resolve(args.output), projected.projection);
+      result.output = path.resolve(args.output);
+    }
+    emit(result);
+  });
 }
 
 function show(args) {
@@ -803,7 +895,7 @@ function usage() {
   console.log(`Persistent Agent Team helper\n\n` +
     `Identity:\n` +
     `  setup  --agent-id <id> --role <${roleIds().join('|')}> --harness <claude-code|codex|gemini-cli|generic> [--repo .] [--force]\n` +
-    `  doctor [--repo .]\n` +
+    `  doctor [--repo .] [--with-spec-suite [--spec-suite <path>]]\n` +
     `  show   [--repo .]\n\n` +
     `Session ledger (in the Git common dir, so all linked worktrees share one):\n` +
     `  status                        Where am I? Sessions and tasks belonging to this worktree's agent\n` +
@@ -829,6 +921,12 @@ function usage() {
     `  validate run       --session <id> --task <id> [--gate <gate>|--check <check-id>] [--candidate <revision>]\n` +
     `  validate show      --session <id> [--task <id>] [--check <check-id>] [--evidence <evidence-id>]\n` +
     `  validate state     --session <id> --task <id> --gate <gate> [--candidate <revision>]   Is this gate satisfied?\n\n` +
+    `spec-suite handoff (only fields the installed spec-suite is known to carry):\n` +
+    `  project-spec-task  --session <id> --task <id> [--output <file>] [--spec-suite <path>]\n` +
+    `  Capabilities are established by exercising them, never by reading docs; what cannot be\n` +
+    `  established reads unknown, and an unknown capability withholds its fields rather than\n` +
+    `  risking a field spec-suite would accept silently and never read.\n\n` +
+    `  spec-suite caps:  ${SPEC_SUITE_CAPABILITIES.join(', ')}\n` +
     `  next action:      ${HANDOFF_ACTIONS.join(', ')}\n` +
     `  session status:   ${SESSION_STATUSES.join(', ')}\n` +
     `  task status:      ${TASK_STATUSES.join(', ')}\n` +
@@ -858,4 +956,5 @@ else if (command === 'handoff') handoffCommand(args);
 else if (command === 'inbox') inbox(args);
 else if (command === 'review') reviewCommand(args);
 else if (command === 'validate') validateCommand(args);
+else if (command === 'project-spec-task') projectSpecTaskCommand(args);
 else die(`unknown command ${command}`);

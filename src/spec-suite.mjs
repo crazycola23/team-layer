@@ -1,0 +1,370 @@
+/**
+ * What the installed spec-suite can actually do, and what may therefore be handed to it.
+ *
+ * Two rules shape everything here.
+ *
+ * 1. **A capability is established by exercising it, never by reading about it.** The plan
+ *    (§8) is explicit that "I read the docs and it seems supported" is not an answer, and
+ *    the reason is not pedantry: spec-suite's task validator *silently accepts unknown
+ *    fields*. Hand it an `inputs` array it has never heard of and nothing complains — the
+ *    gate passes, the field is dropped, and the projection looks like it worked. Prose
+ *    cannot catch that. Running the far side's own projection helper and looking at which
+ *    keys survive can.
+ *
+ * 2. **Unknown is not unsupported, and neither is supported.** Three values, for the same
+ *    reason validation has three: "the mechanism is provably absent" and "I could not
+ *    establish it" lead to different actions. Absent evidence degrades to `unknown`, and
+ *    `unknown` never satisfies a projection — a field travels only on demonstrated support.
+ *
+ * The honest consequence is that a probe reports less than a handshake would. Once
+ * spec-suite ships `scripts/capabilities.mjs` (plan §8, Phase A), `declared` supersedes all
+ * of this and the versions become real numbers instead of `null`. Until then the probe is
+ * what keeps the team layer from guessing, and `compatibilityMode` is where it says so out
+ * loud rather than degrading quietly.
+ */
+import fs from 'node:fs';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
+
+import { jsonDigest } from './digest.mjs';
+
+/** The capabilities the plan's handshake names (§8). Absent from a response means unknown. */
+export const SPEC_SUITE_CAPABILITIES = [
+  'multiAgentConcurrency',
+  'semanticInputs',
+  'mergeGate',
+  'structuralRevalidation',
+  'semanticValidator',
+];
+
+/** Three-valued on purpose. See the header: unknown is not unsupported. */
+export const CAPABILITY_SUPPORT = ['supported', 'unsupported', 'unknown'];
+
+/** Where a capability answer came from, most authoritative first. */
+export const CAPABILITY_SOURCES = ['declared', 'probed', 'unavailable'];
+
+/**
+ * The task fields spec-suite's concurrency contract is known to carry.
+ *
+ * A fallback, and marked `assumed` in the output whenever it is used, because a hardcoded
+ * whitelist is exactly how a field starts being injected that the far side silently
+ * swallows: the list is right on the day it is written and nobody notices when it stops
+ * being. The probe discovers the real list from `projectionConcurrencyFields` when it can,
+ * and this is only what to do when spec-suite is not reachable at all.
+ */
+export const ASSUMED_PROJECTABLE_FIELDS = ['baseRevision', 'readSet', 'writeSet', 'subject', 'role'];
+
+/**
+ * Team packet fields that are the team layer's own and are never projected.
+ *
+ * Not "unsupported" — `acceptance` and `validationPlan` are not things spec-suite is
+ * missing, they are things this layer owns (plan §9: unsupported fields stay in the team
+ * layer). Listing them explicitly is what makes `withheld` readable: an Agent seeing
+ * `inputs` withheld for a capability reason and `acceptance` withheld for an ownership
+ * reason should not have to work out which is which.
+ */
+export const TEAM_LAYER_ONLY_FIELDS = ['schemaVersion', 'taskId', 'sessionId', 'acceptance', 'validationPlan'];
+
+/**
+ * Which capability a projectable field depends on. Fields absent from this map need none.
+ *
+ * Exported so `scripts/validate-skill.mjs` can prove that this map, `ASSUMED_PROJECTABLE_FIELDS`
+ * and `TEAM_LAYER_ONLY_FIELDS` between them account for every field of a task packet. A field
+ * added to the packet and to none of the three would quietly file as `not-projectable`, which
+ * is a decision nobody made appearing as a decision somebody made.
+ */
+export const FIELD_CAPABILITY = { inputs: 'semanticInputs' };
+
+/**
+ * The module that *is* each capability — the ones whose absence settles the question.
+ *
+ * `scripts/merge-gate.mjs` not existing means there is no merge gate to invoke; that is a
+ * fact about spec-suite, and reporting it as `unknown` would be false modesty.
+ */
+const CAPABILITY_MODULES = {
+  multiAgentConcurrency: 'scripts/control-plane-concurrency.mjs',
+  mergeGate: 'scripts/merge-gate.mjs',
+  structuralRevalidation: 'scripts/orchestrate.mjs',
+  semanticValidator: 'scripts/orchestrate.mjs',
+};
+
+/**
+ * Capabilities no file can settle, only an experiment.
+ *
+ * `semanticInputs` is a property of spec-suite's *task contract*, not of a module. The
+ * concurrency module is merely the instrument that reveals it — so that file's absence says
+ * the instrument is missing, not that the feature is, and reporting `unsupported` there
+ * would be the probe mistaking its own blindness for a finding about the far side. A future
+ * spec-suite could carry `inputs` through machinery this skill has never heard of; what it
+ * could not do is carry them past a projection that drops them.
+ */
+const EXPERIMENT_ONLY_CAPABILITIES = ['semanticInputs'];
+
+function answer(support, evidence, version = null) {
+  return { support, version, evidence };
+}
+
+/**
+ * Ask spec-suite what it supports, if it is in a position to be asked.
+ *
+ * `scripts/capabilities.mjs --format json` is the real handshake and is trusted whole,
+ * including versions. Its absence is not a problem to route around silently: the return
+ * value says `probed`, and every caller has to decide what to do with a `version: null`.
+ */
+export function detectCapabilities({ root, timeoutMs = 30_000 } = {}) {
+  if (typeof root !== 'string' || root === '') {
+    return unavailable('no spec-suite root was given, so nothing was asked');
+  }
+  if (!fs.existsSync(root)) {
+    return unavailable(`${root} does not exist`);
+  }
+  const declared = readDeclaredCapabilities(root, timeoutMs);
+  if (declared) return declared;
+  return probeCapabilities(root);
+}
+
+function unavailable(reason) {
+  return {
+    source: 'unavailable',
+    root: null,
+    protocolVersion: null,
+    capabilities: Object.fromEntries(SPEC_SUITE_CAPABILITIES.map((name) => [name, answer('unknown', reason)])),
+    projectableFields: { fields: [...ASSUMED_PROJECTABLE_FIELDS], discovered: false },
+    notes: [reason],
+  };
+}
+
+function readDeclaredCapabilities(root, timeoutMs) {
+  const script = path.join(root, 'scripts', 'capabilities.mjs');
+  if (!fs.existsSync(script)) return null;
+  const run = spawnSync(process.execPath, [script, '--format', 'json'],
+    { cwd: root, encoding: 'utf8', timeout: timeoutMs });
+  if (run.status !== 0 || typeof run.stdout !== 'string') {
+    // A handshake that is present and broken is worse than one that is absent, because a
+    // caller could read the exit code as "no capabilities". Say what happened and probe.
+    const probed = probeCapabilities(root);
+    probed.notes.unshift(`scripts/capabilities.mjs exists but did not answer (exit ${run.status}); probed instead`);
+    return probed;
+  }
+  let response;
+  try {
+    response = JSON.parse(run.stdout);
+  } catch (error) {
+    const probed = probeCapabilities(root);
+    probed.notes.unshift(`scripts/capabilities.mjs did not emit JSON (${error.message}); probed instead`);
+    return probed;
+  }
+  const features = response.features ?? {};
+  const capabilities = Object.fromEntries(SPEC_SUITE_CAPABILITIES.map((name) => {
+    const version = features[name];
+    // A capability the handshake does not mention is unknown, not unsupported. The
+    // handshake is allowed to grow, and an older one has no way to say "definitely not".
+    if (typeof version !== 'number') {
+      return [name, answer('unknown', 'the capability response does not mention it')];
+    }
+    return [name, answer('supported', 'declared by scripts/capabilities.mjs', version)];
+  }));
+  const notes = [];
+  const extra = Object.keys(features).filter((name) => !SPEC_SUITE_CAPABILITIES.includes(name));
+  if (extra.length) notes.push(`spec-suite declares capabilities this skill does not know about: ${extra.join(', ')}`);
+  return {
+    source: 'declared',
+    root,
+    protocolVersion: typeof response.protocolVersion === 'number' ? response.protocolVersion : null,
+    capabilities,
+    projectableFields: discoverProjectableFields(root, notes),
+    notes,
+  };
+}
+
+/**
+ * What can be established about an install that cannot be asked.
+ *
+ * The rule the header states, applied: `supported` requires having run the thing.
+ * `multiAgentConcurrency` and `semanticInputs` are both answered by one experiment — feed
+ * spec-suite's own projection helper a task carrying every team field and see which keys
+ * come back — so both get real answers. Everything else needs a repository, a candidate
+ * and a merge to demonstrate, which a doctor command has no business arranging, so those
+ * report `unknown` with the file that suggests they exist. That is deliberately weaker
+ * than "the file is there, call it supported": a module can exist and not do what its name
+ * says, and the whole point of the handshake is to stop inferring behaviour from names.
+ */
+export function probeCapabilities(root) {
+  const notes = [];
+  const capabilities = {};
+  for (const name of SPEC_SUITE_CAPABILITIES) {
+    if (EXPERIMENT_ONLY_CAPABILITIES.includes(name)) {
+      // Placed here only to keep the declaration order readable in a doctor report; the
+      // experiment below settles it either way, so this evidence is what stands when the
+      // experiment could not be run at all.
+      capabilities[name] = answer('unknown',
+        `${CAPABILITY_MODULES.multiAgentConcurrency} could not be exercised, so whether the task contract carries inputs was never established`);
+      continue;
+    }
+    const relative = CAPABILITY_MODULES[name];
+    capabilities[name] = fs.existsSync(path.join(root, relative))
+      ? answer('unknown', `${relative} is present, but a probe cannot exercise this capability`)
+      : answer('unsupported', `${relative} does not exist`);
+  }
+
+  const fields = discoverProjectableFields(root, notes);
+  if (fields.discovered) {
+    capabilities.multiAgentConcurrency = answer('supported',
+      `${CAPABILITY_MODULES.multiAgentConcurrency} projected a concurrency task: ${fields.fields.join(', ')}`);
+    capabilities.semanticInputs = fields.fields.includes('inputs')
+      ? answer('supported', 'the concurrency projection carries inputs')
+      : answer('unsupported', 'the concurrency projection drops inputs, so semantic inputs stay in the team layer');
+  }
+  notes.push('capabilities were probed, not declared: install spec-suite\'s scripts/capabilities.mjs for versions');
+  return { source: 'probed', root, protocolVersion: null, capabilities, projectableFields: fields, notes };
+}
+
+/**
+ * Which task keys spec-suite actually keeps, discovered by handing it one that has everything.
+ *
+ * This is the experiment that makes the rest trustworthy. The far side accepts unknown
+ * fields without complaint, so the only way to learn what it *keeps* is to give it a task
+ * containing every field this layer has and compare. A grep for field names would pass on
+ * a module that mentions `inputs` in a comment.
+ */
+function discoverProjectableFields(root, notes) {
+  const relative = CAPABILITY_MODULES.multiAgentConcurrency;
+  const module = path.join(root, relative);
+  if (!fs.existsSync(module)) {
+    notes.push(`${relative} is absent, so the projectable fields are assumed rather than discovered`);
+    return { fields: [...ASSUMED_PROJECTABLE_FIELDS], discovered: false };
+  }
+  const probe = [
+    'const m = await import(process.argv[1]);',
+    'const task = JSON.parse(process.argv[2]);',
+    'const projected = m.projectionConcurrencyFields(task);',
+    'process.stdout.write(JSON.stringify(Object.keys(projected ?? {})));',
+  ].join('');
+  const specimen = {
+    baseRevision: `git:${'a'.repeat(40)}`,
+    readSet: ['src/**'],
+    writeSet: ['src/one.ts'],
+    subject: 'agent:probe-01',
+    role: 'fullstack',
+    inputs: [{ id: 'contract:probe', revision: `sha256:${'b'.repeat(64)}`, authority: 'spec-suite' }],
+    acceptance: ['the probe learns something'],
+  };
+  const run = spawnSync(process.execPath,
+    ['--input-type=module', '-e', probe, pathToFileURL(module).href, JSON.stringify(specimen)],
+    { cwd: root, encoding: 'utf8', timeout: 30_000 });
+  if (run.status !== 0) {
+    notes.push(`${relative} could not be exercised (${(run.stderr || '').trim().split('\n').pop() || `exit ${run.status}`}), `
+      + 'so the projectable fields are assumed rather than discovered');
+    return { fields: [...ASSUMED_PROJECTABLE_FIELDS], discovered: false };
+  }
+  let keys;
+  try {
+    keys = JSON.parse(run.stdout);
+  } catch {
+    notes.push(`${relative} answered unreadably, so the projectable fields are assumed rather than discovered`);
+    return { fields: [...ASSUMED_PROJECTABLE_FIELDS], discovered: false };
+  }
+  if (!Array.isArray(keys) || !keys.length) {
+    notes.push(`${relative} kept no fields, so the projectable fields are assumed rather than discovered`);
+    return { fields: [...ASSUMED_PROJECTABLE_FIELDS], discovered: false };
+  }
+  return { fields: keys.filter((key) => typeof key === 'string').sort(), discovered: true };
+}
+
+/**
+ * Turn a frozen team packet into the spec-suite task artifact, and say what did not travel.
+ *
+ * Whitelist rather than blacklist, which is the whole design (plan §9: "不得注入未知字段").
+ * The temptation is to copy the packet and delete what spec-suite does not want, because
+ * that is one line shorter — and it is wrong in the direction that cannot be detected:
+ * every field this layer adds later would ship by default into a validator that accepts it
+ * silently, and the first symptom would be a merge gate that read a field nobody set.
+ *
+ * `withheld` is the other half. A projection that quietly dropped `inputs` would leave an
+ * Agent believing the far side knows about the contract revision its work depends on. Each
+ * entry says which field, why, and where the field is still authoritative — so
+ * "semantic staleness is the team layer's job here" is a statement the tool makes, not a
+ * paragraph somebody has to remember reading.
+ */
+export function projectSpecTask(packet, detection) {
+  if (!packet || typeof packet !== 'object' || Array.isArray(packet)) {
+    throw new TypeError('a task packet must be an object');
+  }
+  const allowed = detection.projectableFields.fields;
+  const projection = {};
+  const withheld = [];
+
+  /**
+   * A capability-governed field is attributed to its capability first, even when the
+   * whitelist never mentioned it.
+   *
+   * The two axes coincide today — `semanticInputs` is discovered by asking whether the
+   * projection keeps `inputs` — but filing it as merely "not in the whitelist" would report
+   * the true fact and lose the actionable one. "spec-suite's task contract does not carry
+   * inputs" reads like a schema note; "semanticInputs is unsupported, so staleness against
+   * your contract revisions is enforced only here" is the thing an Agent has to act on, and
+   * it is what makes the run `degraded` rather than `full`.
+   */
+  for (const [field, capability] of Object.entries(FIELD_CAPABILITY)) {
+    if (!Object.prototype.hasOwnProperty.call(packet, field)) continue;
+    const support = detection.capabilities[capability]?.support ?? 'unknown';
+    if (support === 'supported' && allowed.includes(field)) continue;
+    withheld.push({
+      field,
+      reason: support === 'supported' ? 'not-projectable' : `capability-${support}`,
+      capability,
+      detail: support === 'supported'
+        ? `${capability} is supported but ${field} is not in spec-suite's task contract`
+        : detection.capabilities[capability]?.evidence ?? 'no evidence',
+      authority: 'team-layer',
+    });
+  }
+
+  for (const field of allowed) {
+    if (!Object.prototype.hasOwnProperty.call(packet, field)) continue;
+    if (withheld.some((w) => w.field === field)) continue;
+    projection[field] = packet[field];
+  }
+
+  for (const field of Object.keys(packet)) {
+    if (Object.prototype.hasOwnProperty.call(projection, field)) continue;
+    if (withheld.some((w) => w.field === field)) continue;
+    withheld.push(TEAM_LAYER_ONLY_FIELDS.includes(field)
+      ? { field, reason: 'team-layer-owned', capability: null,
+        detail: 'this layer owns the field; spec-suite is not missing it', authority: 'team-layer' }
+      : { field, reason: 'not-projectable', capability: null,
+        detail: `spec-suite's task contract does not carry ${field}`, authority: 'team-layer' });
+  }
+
+  const capabilityWithheld = withheld.filter((w) => w.reason.startsWith('capability-'));
+  const assumed = !detection.projectableFields.discovered;
+  return {
+    projection,
+    // A digest of the projection alone, so the same packet against the same capabilities
+    // yields the same artifact id and a re-projection is recognisable as a no-op (plan §9).
+    // Deliberately not over the compatibility report: notes mention paths and versions,
+    // and a digest that moved when the *reporting* changed would be no use for comparison.
+    projectionDigest: jsonDigest(projection),
+    projected: Object.keys(projection).sort(),
+    withheld: withheld.sort((a, b) => a.field.localeCompare(b.field)),
+    compatibility: {
+      // `degraded` is a status, not a warning buried in prose: something the far side could
+      // have carried stayed behind, and a caller may reasonably refuse to proceed on it.
+      mode: capabilityWithheld.length ? 'degraded' : 'full',
+      source: detection.source,
+      fieldsDiscovered: !assumed,
+      warnings: [
+        ...capabilityWithheld.map((w) =>
+          `${w.field} was not projected because ${w.capability} is ${w.reason === 'capability-unsupported' ? 'unsupported' : 'unknown'}: `
+          + `it stays in the team layer, so staleness against it is only enforced here`),
+        ...(assumed
+          ? ['the projectable field list was assumed, not discovered: a field spec-suite has since added will not be projected']
+          : []),
+        ...(detection.source !== 'declared'
+          ? ['no capability handshake was available, so no capability versions are known']
+          : []),
+      ],
+    },
+  };
+}

@@ -2,6 +2,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import os from 'node:os';
+
+import {
+  SPEC_SUITE_CAPABILITIES, CAPABILITY_SUPPORT, ASSUMED_PROJECTABLE_FIELDS, TEAM_LAYER_ONLY_FIELDS,
+  FIELD_CAPABILITY, detectCapabilities, probeCapabilities,
+} from '../src/spec-suite.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const failures = [];
@@ -28,7 +34,7 @@ const required = [
   'templates/handoff.md', 'templates/handoff.json', 'templates/task-packet.json', 'templates/finding.json',
   'templates/review-decision.json',
   'scripts/teamctl.mjs', 'src/ledger.mjs', 'src/slug.mjs', 'src/digest.mjs', 'src/schema.mjs',
-  'src/validation.mjs'
+  'src/validation.mjs', 'src/spec-suite.mjs'
 ];
 for (const file of required) ok(fs.existsSync(path.join(ROOT, file)), `missing ${file}`);
 
@@ -324,6 +330,70 @@ ok(checkSchema.$defs?.requiredAt?.items?.$ref === 'validation-gate.schema.json',
   'requiredAt items must $ref the generated gate enum rather than inlining one');
 ok(checkSchema.$defs?.requiredAt?.minItems === 1,
   'a check must name at least one gate: one that gates nothing is a comment');
+
+/**
+ * The far-side contract, held to the two rules it exists to enforce.
+ *
+ * Both checks are here rather than only in tests/spec-suite.test.mjs because this script is
+ * what an installer runs, and both failures are silent in the same direction: a capability
+ * that reads `supported` without evidence, or a packet field nobody classified, produces a
+ * spec-suite handoff that looks complete and is not.
+ */
+const emptyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'team-layer-validate-'));
+try {
+  /**
+   * Nothing may be born supported.
+   *
+   * Pointed at a directory with no spec-suite in it, every answer must be `unsupported` (a
+   * module is provably absent) or `unknown` (nothing could be established). A `supported`
+   * here would mean some capability defaults to trusted, and since the far side accepts
+   * unknown fields without complaint, the field it waves through would be dropped in silence.
+   */
+  for (const [name, answer] of Object.entries(probeCapabilities(emptyDir).capabilities)) {
+    ok(answer.support !== 'supported', `${name} reads supported with no spec-suite present: `
+      + 'a capability must be earned by exercising it');
+    ok(CAPABILITY_SUPPORT.includes(answer.support), `${name} reports ${answer.support}, which is not one of the three`);
+    ok(typeof answer.evidence === 'string' && answer.evidence !== '',
+      `${name} must say what its answer rests on`);
+  }
+  // And an install nobody could look at reads unknown throughout — "I could not look" is not
+  // "it is not there", and only one of the two is fixed by correcting a path.
+  const blind = detectCapabilities({ root: path.join(emptyDir, 'nope') });
+  ok(SPEC_SUITE_CAPABILITIES.every((name) => blind.capabilities[name].support === 'unknown'),
+    'an unreachable spec-suite must read unknown, never unsupported');
+} finally {
+  fs.rmSync(emptyDir, { recursive: true, force: true });
+}
+
+/**
+ * Every task-packet field is either projected, capability-governed, or this layer's own.
+ *
+ * The drift this catches is the next commit's, not this one's: a field added to the packet
+ * schema and to none of the three lists would be withheld as `not-projectable` — a true
+ * statement that nobody decided, and the wrong one for anything spec-suite ought to receive.
+ * Failing here forces the choice to be made where it is visible.
+ */
+const packetFields = Object.keys(JSON.parse(text('schemas/task-packet.schema.json')).properties);
+const classified = new Map();
+for (const [list, fields] of [
+  ['ASSUMED_PROJECTABLE_FIELDS', ASSUMED_PROJECTABLE_FIELDS],
+  ['TEAM_LAYER_ONLY_FIELDS', TEAM_LAYER_ONLY_FIELDS],
+  ['FIELD_CAPABILITY', Object.keys(FIELD_CAPABILITY)],
+]) {
+  for (const field of fields) {
+    ok(packetFields.includes(field), `${list} names ${field}, which is not a task packet field`);
+    ok(!classified.has(field), `${field} is in both ${classified.get(field)} and ${list}`);
+    classified.set(field, list);
+  }
+}
+for (const field of packetFields) {
+  ok(classified.has(field), `task packet field ${field} is in none of ASSUMED_PROJECTABLE_FIELDS, `
+    + 'TEAM_LAYER_ONLY_FIELDS or FIELD_CAPABILITY: decide whether it crosses to spec-suite');
+}
+for (const capability of Object.values(FIELD_CAPABILITY)) {
+  ok(SPEC_SUITE_CAPABILITIES.includes(capability),
+    `FIELD_CAPABILITY names ${capability}, which is not a capability this skill detects`);
+}
 
 const reviewer = text('roles/reviewer.md');
 ok(/not a second implementer/i.test(reviewer), 'reviewer must remain independent');
