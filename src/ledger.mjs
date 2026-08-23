@@ -874,6 +874,11 @@ export class Ledger {
         ...(draft.to.subject ? { toSubject: draft.to.subject } : {}),
         nextAction: handoff.nextAction,
         inputSnapshotDigest: snapshot,
+        // Counted by §14's `unresolvedRaised`, which is the measurement the plan cares about
+        // most: an agent that names what it does not know instead of guessing past it. The
+        // count lives on the event rather than being read back off the handoff file, so the
+        // number survives with the same guarantee as the rest of the log.
+        unresolved: handoff.unresolved.length,
         handoffDigest: record.handoffDigest,
         ...(duplicateOf ? { duplicateOf } : {}),
       });
@@ -1305,6 +1310,7 @@ export class Ledger {
         status: decision.status,
         candidateRevision: decision.candidateRevision,
         inputSnapshotDigest: snapshot,
+        findings: decision.findings.length,
         unresolved: unresolved.length,
         decisionDigest: record.decisionDigest,
       });

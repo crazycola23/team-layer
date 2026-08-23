@@ -1033,3 +1033,408 @@ test('project-spec-task carries semantic inputs to a far side that keeps them', 
   assert.equal(out.withheld.some((w) => w.field === 'inputs'), false);
   assert.equal(out.compatibility.warnings.some((w) => /only enforced here/.test(w)), false);
 });
+
+/**
+ * Plan §12, from the side that matters: an Agent that has just lost its context.
+ *
+ * The command has to answer from the repository rather than from anything it was told, so the
+ * only input the test gives it is a worktree. A worktree with no binding cannot even say who is
+ * asking, and answering anything else would be answering about the wrong Agent.
+ */
+test('reconcile on an unbound worktree says so instead of guessing whose it is', () => {
+  const f = fixture();
+  const out = JSON.parse(run(['reconcile'], f).stdout);
+  assert.equal(out.status, 'unbound');
+  assert.equal(out.nextAction, 'bind-worktree');
+  assert.equal(out.agent, null);
+});
+
+test('reconcile with no session tells the agent to open one', () => {
+  const f = bootstrapped();
+  const out = JSON.parse(run(['reconcile'], f).stdout);
+  assert.equal(out.status, 'idle');
+  assert.equal(out.nextAction, 'open-session');
+  assert.equal(out.agent, 'fullstack-01');
+});
+
+/**
+ * The exit code is 0 whatever reconcile finds, including a block.
+ *
+ * A recovering Agent runs this before it can trust anything else it remembers. If "you have a
+ * review to address" exited non-zero it would be indistinguishable from the tool having failed
+ * to look — and of every outcome, that is the one that must never be confusable, because the
+ * Agent's fallback when a command fails is exactly the remembered state this command exists to
+ * replace.
+ */
+test('reconcile finds this agent task and answers at exit 0 whatever it finds', () => {
+  const f = bootstrapped();
+  const head = git(['rev-parse', 'HEAD'], f.repo);
+  const branch = git(['rev-parse', '--abbrev-ref', 'HEAD'], f.repo);
+  run(['session', 'start', '--session', 'feature:coupon', '--target', branch], f);
+  writePacket(f, taskPacket({ baseRevision: `git:${head}` }));
+  run(['task', 'issue', '--packet', 'packet.json'], f);
+
+  const out = JSON.parse(run(['reconcile'], f).stdout);
+  assert.equal(out.agent, 'fullstack-01');
+  assert.equal(out.session, 'feature:coupon');
+  assert.equal(out.task, 'task:coupon-api');
+  assert.equal(out.freshness.git, 'fresh', 'the task is based on the target branch current commit');
+  assert.equal(out.detail.role, 'fullstack');
+  assert.equal(out.detail.taskStatus, 'issued');
+  // The packet requires unit-tests at the handoff gate and nothing has been recorded, so the
+  // gate is unestablished rather than passed — and unestablished is work, not a block.
+  assert.equal(out.status, 'ready');
+  assert.equal(out.nextAction, 'run-validation');
+});
+
+/**
+ * A task addressed to somebody else is not this Agent's task.
+ *
+ * One session holds several Agents' tasks by design, so the filter on `frozen.subject` is the
+ * only thing standing between a recovering Agent and somebody else's work — and it would be
+ * handed over with the ledger's blessing, writeSet and all. Naming the session is what makes
+ * `await-task` sayable: without it nothing in the ledger associates this Agent with a session at
+ * all, and the honest answer is the one the previous test gets.
+ */
+test('reconcile ignores a task addressed to another agent', () => {
+  const f = bootstrapped();
+  run(['session', 'start', '--session', 'feature:coupon', '--target', 'main'], f);
+  writePacket(f, taskPacket({ taskId: 'task:coupon-review', subject: 'agent:reviewer-01', role: 'reviewer' }));
+  run(['task', 'issue', '--packet', 'packet.json'], f);
+
+  const named = JSON.parse(run(['reconcile', '--session', 'feature:coupon'], f).stdout);
+  assert.equal(named.status, 'idle');
+  assert.equal(named.nextAction, 'await-task');
+  assert.equal(named.task, null, "the reviewer's task is not answered about");
+  assert.match(named.reasons[0], /feature:coupon has no task addressed to this agent/);
+
+  const blind = JSON.parse(run(['reconcile'], f).stdout);
+  assert.equal(blind.task, null);
+  assert.equal(blind.nextAction, 'open-session');
+});
+
+/**
+ * Finishing one task does not make it the task, while another is still open.
+ *
+ * The completed task is the most recently touched, so recency alone would answer with it — and
+ * `integrate the thing you finished` is a plausible-looking answer that abandons work in
+ * progress. Terminal tasks rank last and are chosen only when nothing else is open, which is
+ * also what makes them reachable at all: an Agent whose last act was completing a task still
+ * needs to be told to get it reviewed.
+ */
+test('reconcile prefers the open task over the one just completed', () => {
+  const f = bootstrapped();
+  const branch = git(['rev-parse', '--abbrev-ref', 'HEAD'], f.repo);
+  run(['session', 'start', '--session', 'feature:coupon', '--target', branch], f);
+  writePacket(f, taskPacket({ taskId: 'task:coupon-api' }));
+  run(['task', 'issue', '--packet', 'packet.json'], f);
+  writePacket(f, taskPacket({ taskId: 'task:coupon-ui' }), 'packet-2.json');
+  run(['task', 'issue', '--packet', 'packet-2.json'], f);
+  for (const status of ['in-progress', 'completed']) {
+    run(['task', 'set-status', '--session', 'feature:coupon', '--task', 'task:coupon-api',
+      '--status', status], f);
+  }
+
+  const out = JSON.parse(run(['reconcile'], f).stdout);
+  assert.equal(out.task, 'task:coupon-ui', 'the finished task is the most recent, and still not the answer');
+  assert.equal(out.detail.taskStatus, 'issued');
+});
+
+/**
+ * The gate follows the task's status, because the caller cannot be asked which gate it is at.
+ *
+ * An Agent that has just lost its context is exactly the caller that cannot supply `--gate`, and
+ * the two gates require different checks. Reporting the handoff gate for finished work would call
+ * a task validated when the merge gate's checks had never run — `passed` on the strength of
+ * having asked an easier question.
+ */
+test('reconcile reads completed work against the merge gate, not the handoff gate', () => {
+  const f = bootstrapped();
+  const branch = git(['rev-parse', '--abbrev-ref', 'HEAD'], f.repo);
+  run(['session', 'start', '--session', 'feature:coupon', '--target', branch], f);
+  writePacket(f, taskPacket({
+    validationPlan: [
+      { checkId: 'unit-tests', kind: 'command', requiredAt: ['handoff'], command: 'npm test' },
+      { checkId: 'contract-tests', kind: 'command', requiredAt: ['merge'], command: 'npm run contract' },
+    ],
+  }));
+  run(['task', 'issue', '--packet', 'packet.json'], f);
+
+  const open = JSON.parse(run(['reconcile'], f).stdout);
+  assert.equal(open.detail.validation.gate, 'handoff');
+  assert.equal(open.detail.validation.required, 1);
+
+  for (const status of ['in-progress', 'completed']) {
+    run(['task', 'set-status', '--session', 'feature:coupon', '--task', 'task:coupon-api',
+      '--status', status], f);
+  }
+  const done = JSON.parse(run(['reconcile'], f).stdout);
+  assert.equal(done.detail.validation.gate, 'merge', 'finished work faces the merge gate');
+  assert.equal(done.detail.validation.required, 1);
+  // Same command, different gate: `--gate` stays for what the mapping cannot know about, such as
+  // revalidating at the handoff gate after a rebase.
+  const forced = JSON.parse(run(['reconcile', '--gate', 'handoff'], f).stdout);
+  assert.equal(forced.detail.validation.gate, 'handoff');
+});
+
+/**
+ * A base commit this worktree does not have leaves ancestry unanswered, not answered "no".
+ *
+ * `merge-base --is-ancestor` says yes with exit 0 and no with exit 1, and anything above that is
+ * git declining to answer — most often a commit that exists somewhere else. Both readings report
+ * `stale`, so the difference lands entirely in the detail, and it is the difference between "the
+ * target moved ahead, rebase" and "the histories diverged, do not rebase unattended". Telling an
+ * Agent the histories diverged on the strength of an object it simply has not fetched is a
+ * fabricated finding about somebody else's branch.
+ */
+test('reconcile admits when git could not establish ancestry', () => {
+  const f = bootstrapped();
+  const branch = git(['rev-parse', '--abbrev-ref', 'HEAD'], f.repo);
+  run(['session', 'start', '--session', 'feature:coupon', '--target', branch], f);
+  writePacket(f, taskPacket({ baseRevision: `git:${'d'.repeat(40)}` }));
+  run(['task', 'issue', '--packet', 'packet.json'], f);
+
+  const out = JSON.parse(run(['reconcile'], f).stdout);
+  assert.equal(out.freshness.git, 'stale');
+  assert.equal(out.detail.git.baseIsAncestor, null, 'git exited above 1: it did not say no');
+  assert.match(out.detail.git.detail, /ancestry could not be established/);
+  assert.doesNotMatch(out.detail.git.detail, /diverged/,
+    'a divergence nobody established must not be reported as one');
+});
+
+/**
+ * Reconcile refuses on a truncated log rather than deciding from what is left.
+ *
+ * The inbox tolerates an unreadable session because one corrupt session must not hide every other
+ * session's mail, and `metrics` names it in `unreadable` for the same reason. Reconcile cannot:
+ * this is the only session it is answering about, and "no unacknowledged handoffs" derived from a
+ * log missing its tail is a confident wrong answer to the one question the command exists to
+ * answer. Exit 3, so a wrapper can tell it from the exit 0 that carries a finding.
+ */
+test('reconcile refuses to answer from a log whose tail is missing', () => {
+  const f = bootstrapped();
+  run(['session', 'start', '--session', 'feature:coupon', '--target', 'main'], f);
+  writePacket(f, taskPacket());
+  run(['task', 'issue', '--packet', 'packet.json'], f);
+
+  const events = path.join(f.repo, '.git', 'team-layer', 'sessions', 'feature__coupon', 'events.jsonl');
+  const lines = fs.readFileSync(events, 'utf8').split('\n').filter((line) => line !== '');
+  assert.ok(lines.length > 1, 'the log needs a tail to lose');
+  fs.writeFileSync(events, `${lines.slice(0, -1).join('\n')}\n`);
+
+  assert.deepEqual(refusal(['reconcile'], f), { code: 'LEDGER_CORRUPT', exit: 3 });
+});
+
+/**
+ * The default answer for inputs is `unknown`, and it is not a bug.
+ *
+ * This layer holds `{ id, revision }` and the canonical authority resolves revisions from
+ * *paths*, so there is no way for reconcile to check freshness by itself while the revision
+ * handshake is unbuilt. Reporting `fresh` would be inventing the check; reporting `unknown` and
+ * naming the flag that supplies it is the honest version, and this test pins it so nobody
+ * "tidies" the field to fresh later.
+ */
+test('reconcile reports inputs as unknown until somebody who can ask the authority answers', () => {
+  const f = bootstrapped();
+  const head = git(['rev-parse', 'HEAD'], f.repo);
+  const branch = git(['rev-parse', '--abbrev-ref', 'HEAD'], f.repo);
+  run(['session', 'start', '--session', 'feature:coupon', '--target', branch], f);
+  writePacket(f, taskPacket({ baseRevision: `git:${head}` }));
+  run(['task', 'issue', '--packet', 'packet.json'], f);
+
+  const blind = JSON.parse(run(['reconcile'], f).stdout);
+  assert.equal(blind.freshness.inputs, 'unknown');
+  assert.deepEqual(blind.detail.inputs.unchecked, ['contract:coupon']);
+
+  fs.writeFileSync(path.join(f.repo, 'canonical.json'),
+    `${JSON.stringify([{ id: 'contract:coupon', revision: `sha256:${'1'.repeat(64)}` }])}\n`);
+  const checked = JSON.parse(run(['reconcile', '--canonical-inputs', 'canonical.json'], f).stdout);
+  assert.equal(checked.freshness.inputs, 'fresh');
+  assert.deepEqual(checked.detail.inputs.unchecked, []);
+});
+
+/**
+ * Plan §17 Scenario 2 as the recovering Agent sees it.
+ *
+ * The authority has moved on, so the answer is a reissue rather than a rebase: restating the
+ * task restates the base too, and rebasing first would be work the reissue throws away. The
+ * losing finding still appears in `reasons`, because a precedence nobody can inspect is
+ * folklore.
+ */
+test('reconcile answers a moved canonical revision with reissue-task', () => {
+  const f = bootstrapped();
+  const branch = git(['rev-parse', '--abbrev-ref', 'HEAD'], f.repo);
+  run(['session', 'start', '--session', 'feature:coupon', '--target', branch], f);
+  writePacket(f, taskPacket({ baseRevision: 'git:abc1234' }));
+  run(['task', 'issue', '--packet', 'packet.json'], f);
+
+  fs.writeFileSync(path.join(f.repo, 'canonical.json'),
+    `${JSON.stringify([{ id: 'contract:coupon', revision: `sha256:${'2'.repeat(64)}` }])}\n`);
+  const out = JSON.parse(run(['reconcile', '--canonical-inputs', 'canonical.json'], f).stdout);
+  assert.equal(out.status, 'stale');
+  assert.equal(out.nextAction, 'reissue-task');
+  assert.equal(out.freshness.inputs, 'stale');
+  assert.match(out.reasons[0], /inputs are stale/);
+  assert.deepEqual(out.detail.inputs.stale.map((s) => s.id), ['contract:coupon']);
+});
+
+/**
+ * A target branch this worktree cannot resolve is `unknown`, never `fresh`.
+ *
+ * The plan's §17 Scenario 4 is a base that fell behind, and the check for it depends on being
+ * able to read the target at all. A fetch that never happened, a branch that only exists on the
+ * remote, a target named in a session and deleted since — all of them leave the question
+ * unanswered, and an unanswered staleness question reported as fresh is how an Agent ends up
+ * confidently building on a base nobody checked.
+ */
+test('reconcile reports unknown git freshness when the integration target cannot be resolved', () => {
+  const f = bootstrapped();
+  run(['session', 'start', '--session', 'feature:coupon', '--target', 'no-such-branch'], f);
+  writePacket(f, taskPacket());
+  run(['task', 'issue', '--packet', 'packet.json'], f);
+
+  const out = JSON.parse(run(['reconcile'], f).stdout);
+  assert.equal(out.freshness.git, 'unknown');
+  assert.equal(out.detail.git.targetCommit, null);
+  assert.match(out.detail.git.detail, /never established/);
+});
+
+/**
+ * A handoff waiting to be acknowledged is the answer, and it outranks ordinary work.
+ *
+ * Reviewer-to-Fullstack mail is how a task changes hands, so an Agent that resumes and starts
+ * coding without reading it has resumed against a state somebody already superseded.
+ */
+test('reconcile surfaces an unacknowledged handoff addressed to this agent', () => {
+  const f = bootstrapped({ agentId: 'fullstack-01', role: 'fullstack' });
+  const head = git(['rev-parse', 'HEAD'], f.repo);
+  const branch = git(['rev-parse', '--abbrev-ref', 'HEAD'], f.repo);
+  run(['session', 'start', '--session', 'feature:coupon', '--target', branch], f);
+  writePacket(f, taskPacket({ baseRevision: `git:${head}` }));
+  run(['task', 'issue', '--packet', 'packet.json'], f);
+
+  const linked = path.join(f.dir, 'wt-reviewer');
+  git(['worktree', 'add', linked, '-b', 'review'], f.repo);
+  const g = { dir: f.dir, repo: linked, home: f.home };
+  run(['setup', '--agent-id', 'reviewer-01', '--role', 'reviewer', '--harness', 'codex', '--repo', linked], g);
+  writeDraft(g, {
+    sessionId: 'feature:coupon',
+    taskId: 'task:coupon-api',
+    to: { role: 'fullstack' },
+    nextAction: 'implement',
+    summary: 'The contract is frozen; the stacking rules are yours to write.',
+  });
+  run(['handoff', 'publish', '--handoff', 'draft.json'], g);
+
+  const out = JSON.parse(run(['reconcile'], f).stdout);
+  // Ahead of `run-validation`, which is also true here: the gate is unestablished, but running
+  // it against a state a handoff has already superseded is the wasted work this ordering avoids.
+  assert.equal(out.nextAction, 'ack-handoff');
+  assert.equal(out.detail.unackedHandoffs.length, 1);
+  assert.equal(out.detail.unackedHandoffs[0].nextAction, 'implement');
+  assert.deepEqual(out.detail.unackedHandoffs[0].from, { subject: 'agent:reviewer-01', role: 'reviewer' });
+  assert.ok(out.reasons.some((r) => /validation is unknown/.test(r)),
+    'the losing finding is still reported, so the precedence can be argued with');
+});
+
+/**
+ * §14's counters, and the honest report of the ones nothing records.
+ *
+ * A dashboard whose `humanInterventions` reads 0 because nothing observes it is
+ * indistinguishable from the outcome this whole plan aims at, so the gap is printed as a gap
+ * with a reason. The counted half comes from the sealed event log rather than a directory scan,
+ * because the log is the half whose completeness `session.eventSeq` can prove.
+ */
+test('metrics counts what the log proves and names what nothing records', () => {
+  const f = bootstrapped();
+  run(['session', 'start', '--session', 'feature:coupon', '--target', 'main'], f);
+  writePacket(f, taskPacket());
+  run(['task', 'issue', '--packet', 'packet.json'], f);
+  run(['task', 'set-status', '--session', 'feature:coupon', '--task', 'task:coupon-api',
+    '--status', 'in-progress'], f);
+
+  const out = JSON.parse(run(['metrics'], f).stdout);
+  assert.equal(out.totals.sessions, 1);
+  assert.equal(out.totals.tasksIssued, 1);
+  assert.equal(out.totals.taskStatusChanges, 1);
+  assert.equal(out.totals.handoffs, 0);
+  assert.deepEqual(out.unreadable, []);
+  assert.equal(out.sessions[0].sessionId, 'feature:coupon');
+  assert.ok(out.unavailable.some((u) => u.metric === 'humanInterventions'),
+    'a metric nothing records is named rather than printed as zero');
+  assert.ok(out.unavailable.every((u) => typeof u.reason === 'string' && u.reason.length > 40),
+    'every gap says whose fact it is');
+});
+
+/**
+ * `reviewFindings` exists because the round count alone would flatter a noisy review.
+ *
+ * A review that raised nine findings and one that raised none are both a single
+ * `review-recorded` event, so counting rounds and calling it review load would report the two
+ * as identical. The count comes off the event payload, which is why the event carries it.
+ */
+test('metrics counts review findings from the event payload, not just the rounds', () => {
+  const f = bootstrapped({ agentId: 'reviewer-01', role: 'reviewer' });
+  run(['session', 'start', '--session', 'feature:coupon', '--target', 'main'], f);
+  writePacket(f, taskPacket());
+  run(['task', 'issue', '--packet', 'packet.json'], f);
+  const head = `git:${git(['rev-parse', 'HEAD'], f.repo)}`;
+  const finding = (id, severity, evidence) => ({
+    schemaVersion: 1, findingId: id, severity, status: 'open', candidateRevision: head,
+    requirement: 'AC-1', location: 'src/coupon.ts:1', evidence,
+    impact: 'The total a customer is charged is wrong.',
+    requiredOutcome: 'At most one coupon applies, and the error path is covered.',
+  });
+  writeDraft(f, {
+    sessionId: 'feature:coupon', taskId: 'task:coupon-api', status: 'changes-requested',
+    candidateRevision: head, requirementsRevision: `sha256:${'1'.repeat(64)}`,
+    findings: [
+      finding('FIND-001', 'major', 'Stacking is applied twice: once in the API and once in the domain.'),
+      finding('FIND-002', 'minor', 'No test covers the expired-coupon path.'),
+    ],
+    summary: 'Two findings, one round.',
+  }, 'decision.json');
+  run(['review', 'record', '--review', 'decision.json'], f);
+
+  const out = JSON.parse(run(['metrics', '--session', 'feature:coupon'], f).stdout);
+  assert.equal(out.totals.reviewRounds, 1);
+  assert.equal(out.totals.reviewFindings, 2, 'one round, two findings — the round count alone would say one');
+  assert.equal(out.totals.reviewApprovals, 0);
+  assert.equal(out.totals.unresolvedFindings, 2, 'both findings are open, so both are unresolved');
+  assert.equal(out.totals.unresolvedRaised, 0,
+    'and no handoff raised a fact: the two senses of unresolved are counted apart');
+});
+
+/**
+ * `unresolvedRaised` is §14's own metric, and the one whose absence would be least visible.
+ *
+ * A handoff that carried no unresolved list is exactly the handoff where an Agent may have
+ * guessed instead of asking, so the count has to come off the event rather than from the number
+ * of handoffs: one handoff raising two questions and one raising none are the same event count
+ * and the opposite outcome. This is the counter the plan reads to decide whether the layer is
+ * making Agents stop at the edge of what they know.
+ */
+test('metrics counts the facts a handoff declined to guess past', () => {
+  const f = bootstrapped();
+  run(['session', 'start', '--session', 'feature:coupon', '--target', 'main'], f);
+  writePacket(f, taskPacket());
+  run(['task', 'issue', '--packet', 'packet.json'], f);
+  writeDraft(f, {
+    sessionId: 'feature:coupon',
+    taskId: 'task:coupon-api',
+    to: { role: 'product-architect' },
+    nextAction: 'clarify',
+    summary: 'Two questions I am not going to answer by guessing.',
+    unresolved: [
+      'Whether an expired coupon on a saved cart is still honoured.',
+      'Whether stacking is forbidden outright or merely capped.',
+    ],
+  });
+  run(['handoff', 'publish', '--handoff', 'draft.json'], f);
+
+  const out = JSON.parse(run(['metrics'], f).stdout);
+  assert.equal(out.totals.handoffs, 1);
+  assert.equal(out.totals.unresolvedRaised, 2,
+    'two facts, one handoff — counting handoffs would report the same number for a handoff that asked nothing');
+  assert.equal(out.totals.unresolvedFindings, 0, 'no review left a finding open: the two senses stay apart');
+});

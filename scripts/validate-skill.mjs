@@ -8,6 +8,8 @@ import {
   SPEC_SUITE_CAPABILITIES, CAPABILITY_SUPPORT, ASSUMED_PROJECTABLE_FIELDS, TEAM_LAYER_ONLY_FIELDS,
   FIELD_CAPABILITY, detectCapabilities, probeCapabilities,
 } from '../src/spec-suite.mjs';
+import { NEXT_ACTIONS, RECONCILE_STATUSES } from '../src/reconcile.mjs';
+import { METRIC_SOURCES, DERIVED_METRICS, UNAVAILABLE_METRICS } from '../src/metrics.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const failures = [];
@@ -34,7 +36,7 @@ const required = [
   'templates/handoff.md', 'templates/handoff.json', 'templates/task-packet.json', 'templates/finding.json',
   'templates/review-decision.json',
   'scripts/teamctl.mjs', 'src/ledger.mjs', 'src/slug.mjs', 'src/digest.mjs', 'src/schema.mjs',
-  'src/validation.mjs', 'src/spec-suite.mjs'
+  'src/validation.mjs', 'src/spec-suite.mjs', 'src/reconcile.mjs', 'src/metrics.mjs'
 ];
 for (const file of required) ok(fs.existsSync(path.join(ROOT, file)), `missing ${file}`);
 
@@ -394,6 +396,69 @@ for (const capability of Object.values(FIELD_CAPABILITY)) {
   ok(SPEC_SUITE_CAPABILITIES.includes(capability),
     `FIELD_CAPABILITY names ${capability}, which is not a capability this skill detects`);
 }
+
+/**
+ * Every action `reconcile` can name must be in the precedence list.
+ *
+ * This one is worth an installer-time check because of how the miss behaves: precedence is
+ * `NEXT_ACTIONS.indexOf(action)`, and a typo returns -1, which sorts *first*. A misspelled
+ * action would not be ignored — it would silently outrank every real finding and become the
+ * answer a recovering Agent acts on. Reading the source for the literals is crude, but the
+ * alternative is discovering it from a bug report about the one command that exists to be
+ * trustworthy when nothing else is.
+ *
+ * The status in the same position is checked alongside it, which is why both helpers must take
+ * their arguments in the same order — the scan cannot tell an action from a status otherwise,
+ * and it was this check that caught them disagreeing.
+ */
+const reconcileSource = text('src/reconcile.mjs');
+const declaredActions = new Set(NEXT_ACTIONS);
+let namedPairs = 0;
+for (const [, status, action] of reconcileSource.matchAll(/(?:finding|answer)\(\s*'([a-z-]+)',\s*'([a-z-]+)'/g)) {
+  namedPairs += 1;
+  ok(declaredActions.has(action), `reconcile names the action ${action}, which is not in NEXT_ACTIONS: `
+    + 'an unlisted action sorts to -1 and would outrank every real finding');
+  ok(RECONCILE_STATUSES.includes(status), `reconcile reports the status ${status}, which is not in RECONCILE_STATUSES`);
+}
+// Both helpers take (status, nextAction), which is what makes the pair above readable at all.
+// If somebody swaps one of them back, every literal lands in the wrong vocabulary and the two
+// assertions light up together — but only if the scan found the call sites in the first place.
+ok(namedPairs >= NEXT_ACTIONS.length, `reconcile only names ${namedPairs} status/action pairs, `
+  + `fewer than the ${NEXT_ACTIONS.length} actions it declares: either an action is unreachable or the scan missed a call site`);
+ok(new Set(NEXT_ACTIONS).size === NEXT_ACTIONS.length, 'NEXT_ACTIONS has a duplicate, so its precedence is ambiguous');
+
+/**
+ * Every counted metric must be wired to an event kind something actually emits.
+ *
+ * A metric pointed at a kind no writer produces reports 0 forever, which is the exact failure
+ * `src/metrics.mjs` refuses to commit for the metrics it cannot get — so it must not commit it
+ * here by accident either. The kinds are read out of the ledger's own `#commit` calls, which
+ * makes renaming an event kind without renaming its metric a failure at install time rather
+ * than a dashboard that flatlines quietly.
+ */
+const emittedKinds = new Set([...text('src/ledger.mjs').matchAll(/kind:\s*'([a-z-]+)'/g)].map((m) => m[1]));
+for (const [metric, kind] of Object.entries(METRIC_SOURCES)) {
+  ok(emittedKinds.has(kind), `metric ${metric} counts the event kind ${kind}, which the ledger never emits: `
+    + 'it would report 0 forever');
+}
+for (const entry of UNAVAILABLE_METRICS) {
+  ok(!(entry.metric in METRIC_SOURCES) && !DERIVED_METRICS.includes(entry.metric),
+    `${entry.metric} is listed as unavailable and also counted`);
+  ok(typeof entry.reason === 'string' && entry.reason.length > 40,
+    `${entry.metric} is listed as unavailable without saying why, which reads as an excuse rather than a work item`);
+}
+/**
+ * A name in both lists would be one counter with two writers.
+ *
+ * `zeroed()` builds the counter set from both lists, so a collision produces a single key that
+ * the occurrence loop and the payload sum both add to — a number that is the two metrics added
+ * together, under one of their names. Cheap to check, and invisible in any output.
+ */
+for (const metric of DERIVED_METRICS) {
+  ok(!(metric in METRIC_SOURCES),
+    `${metric} is both counted by occurrence and summed from a payload, so its value would be neither`);
+}
+ok(new Set(DERIVED_METRICS).size === DERIVED_METRICS.length, 'DERIVED_METRICS names the same metric twice');
 
 const reviewer = text('roles/reviewer.md');
 ok(/not a second implementer/i.test(reviewer), 'reviewer must remain independent');

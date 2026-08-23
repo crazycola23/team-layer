@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 
 import { roleIds, isRole, roleFile, roleVersion } from '../src/roles.mjs';
 import { Ledger, LedgerError, SESSION_STATUSES, TASK_STATUSES, HANDOFF_ACTIONS, REVIEW_STATUSES } from '../src/ledger.mjs';
@@ -11,6 +11,8 @@ import { SlugError } from '../src/slug.mjs';
 import { DigestError } from '../src/digest.mjs';
 import { runCommandCheck, checksRequiredAt, VALIDATION_GATES } from '../src/validation.mjs';
 import { detectCapabilities, projectSpecTask, SPEC_SUITE_CAPABILITIES } from '../src/spec-suite.mjs';
+import { gitFreshness, inputsFreshness, decide, NEXT_ACTIONS, RECONCILE_STATUSES } from '../src/reconcile.mjs';
+import { collectMetrics } from '../src/metrics.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const SCRIPT_DIR = path.dirname(__filename);
@@ -483,21 +485,32 @@ function show(args) {
  * audit log where the actor is whatever the caller felt like typing is not
  * evidence of anything.
  */
-function actorFor(repo, args) {
+function actorFor(repo, args, { optional = false } = {}) {
   const bindingPath = path.join(repo.root, '.agent-team-binding.json');
   if (fs.existsSync(bindingPath)) {
     const binding = readJson(bindingPath);
     if (binding.agentId) return `agent:${binding.agentId}`;
   }
   if (typeof args.actor === 'string') return args.actor;
+  if (optional) return null;
   die('no agent binding found in this worktree; run `teamctl setup` first, or pass --actor for a one-off');
 }
 
-function ledgerFor(args) {
+/**
+ * `actorRequired: false` is for the read-only commands, and `reconcile` is why it exists.
+ *
+ * Every command that writes needs an actor, because an event nobody is attributed to is an
+ * event nobody can be asked about. But `reconcile` runs when an Agent knows nothing — possibly
+ * including whether this worktree is bound at all — and dying with a usage error would mean
+ * demanding an identity as the price of being told you have none. It never writes, so the
+ * ledger's own default attribution is never recorded anywhere.
+ */
+function ledgerFor(args, { actorRequired = true } = {}) {
   const repo = repoInfo(args.repo || '.');
+  const actor = actorFor(repo, args, { optional: !actorRequired });
   const ledger = new Ledger({
     commonDir: repo.commonDir,
-    actor: actorFor(repo, args),
+    ...(actor === null ? {} : { actor }),
     ...(args['lock-timeout'] ? { lockTimeoutMs: Number(args['lock-timeout']) } : {}),
   });
   return { repo, ledger };
@@ -891,6 +904,186 @@ function validateCommand(args) {
   });
 }
 
+/**
+ * The gate a task is facing next.
+ *
+ * Derived from the task's own status rather than asked for, because the caller of `reconcile`
+ * is by construction an Agent that does not remember where it was. Work that is not finished
+ * is heading for a handoff; work that is finished is heading for a merge. `--gate` overrides
+ * it for the cases the mapping cannot know about, such as a revalidation after a rebase.
+ */
+function gateFor(task, args) {
+  if (typeof args.gate === 'string' && args.gate !== '') {
+    if (!VALIDATION_GATES.includes(args.gate)) die(`--gate must be one of ${VALIDATION_GATES.join(', ')}`);
+    return args.gate;
+  }
+  return task.state.status === 'completed' ? 'merge' : 'handoff';
+}
+
+/** git, but a failure is an observation rather than the end of the command. See `reconcileCommand`. */
+function tryGit(argv, cwd) {
+  try {
+    return execFileSync('git', argv, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Three-valued git: yes, no, or "the question could not be put".
+ *
+ * `merge-base --is-ancestor` answers by exit code, so it needs the status rather than stdout —
+ * and it needs all three answers kept apart. Exit 1 means the base is genuinely not in the
+ * target's history; anything above 1 means git could not tell (a commit this worktree does not
+ * have, most often), which is not the same finding and must not be reported as one.
+ */
+function gitSucceeds(argv, cwd) {
+  const res = spawnSync('git', argv, { cwd, encoding: 'utf8' });
+  if (res.error || res.status === null || res.status > 1) return null;
+  return res.status === 0;
+}
+
+/**
+ * The task this worktree's agent is on, or null.
+ *
+ * Takes no session id in the ordinary case (plan §12) — an Agent recovering from a context
+ * loss cannot be asked which session it was in, so the binding is what identifies it and the
+ * ledger is what remembers the rest. Among candidates the most recently updated non-terminal
+ * task wins, and a terminal one is only chosen when nothing else is open: reconcile should
+ * answer "integrate the finished thing" rather than "there is nothing to do" when the last
+ * act was completing a task.
+ */
+function currentTask(ledger, subject, args) {
+  const candidates = [];
+  for (const sessionId of ledger.listSessions()) {
+    if (typeof args.session === 'string' && args.session !== '' && args.session !== sessionId) continue;
+    const session = ledger.readSession(sessionId);
+    for (const taskId of ledger.listTasks(sessionId)) {
+      if (typeof args.task === 'string' && args.task !== '' && args.task !== taskId) continue;
+      const task = ledger.readTask(sessionId, taskId);
+      if (subject !== null && task.frozen.subject !== subject) continue;
+      candidates.push({ session, task });
+    }
+  }
+  if (!candidates.length) return null;
+  const terminal = new Set(['completed', 'cancelled']);
+  const rank = (c) => (terminal.has(c.task.state.status) ? 1 : 0);
+  candidates.sort((a, b) => rank(a) - rank(b)
+    || String(b.task.state.updatedAt).localeCompare(String(a.task.state.updatedAt)));
+  return candidates[0];
+}
+
+/**
+ * `teamctl reconcile` — one command, one next action, after a context compaction (plan §12).
+ *
+ * Exits 0 whatever it finds, including `blocked`. A recovering Agent needs the answer, and a
+ * non-zero exit for "you have a review to address" would be indistinguishable from the tool
+ * having failed to look — which is the one outcome that must not be confusable with a finding.
+ *
+ * The canonical revisions are supplied, not fetched. This layer holds input *ids* and the
+ * revisions they were frozen at, never the locations; only the canonical authority can say
+ * what the current revision of `contract:checkout` is. Rather than infer freshness from
+ * having nothing to compare against, `--canonical-inputs` accepts the observation from
+ * whoever can make it and the report reads `unknown` when nobody did.
+ */
+function reconcileCommand(args) {
+  const { repo, ledger } = ledgerFor(args, { actorRequired: false });
+  const binding = bindingFor(repo);
+  const subject = binding ? `agent:${binding.agentId}` : null;
+
+  runLedger(() => {
+    const found = binding ? currentTask(ledger, subject, args) : null;
+    // A session named on the command line is read even when it holds no task for this agent, so
+    // the answer can be `await-task`. Without the flag a session is only reachable *through* a
+    // task — nothing associates an Agent with a session until one is addressed to it — and
+    // answering `open-session` to an Agent whose session already exists sends it into a
+    // collision it cannot act on from there.
+    const named = typeof args.session === 'string' && args.session !== '' ? args.session : null;
+    const session = found?.session
+      ?? (named && ledger.listSessions().includes(named) ? ledger.readSession(named) : null);
+    const task = found?.task ?? null;
+
+    const target = session?.integrationTarget ?? null;
+    // The inbox tolerates a session whose event log cannot be read, because one corrupt session
+    // must not hide every other session's mail. Reconcile cannot afford the same tolerance: this
+    // is the only session it is answering about, and "no unacknowledged handoffs" derived from a
+    // truncated log is a confident wrong answer. Refuse instead, before deciding anything.
+    if (session) ledger.readEvents(session.sessionId, { expectSeq: session.eventSeq });
+    const targetCommit = target ? tryGit(['rev-parse', '--verify', `${target}^{commit}`], repo.root) : null;
+    const base = task?.frozen.baseRevision ?? null;
+    const baseIsAncestor = base && targetCommit
+      ? gitSucceeds(['merge-base', '--is-ancestor', base.replace(/^git:/, ''), targetCommit], repo.root)
+      : null;
+    const git = gitFreshness({ baseRevision: base, target, targetCommit, baseIsAncestor });
+
+    let observed = null;
+    if (typeof args['canonical-inputs'] === 'string' && args['canonical-inputs'] !== '') {
+      observed = readJson(path.resolve(args['canonical-inputs']));
+      if (!Array.isArray(observed)) {
+        die('--canonical-inputs must hold a JSON array of { id, revision } as the canonical authority currently reports them');
+      }
+    }
+    const inputs = inputsFreshness({ inputs: task?.frozen.inputs ?? null, observed });
+
+    const handoffs = task
+      ? ledger.inbox({ role: binding.role, subject })
+        .filter((row) => row.sessionId === session.sessionId && row.taskId === task.frozen.taskId)
+      : [];
+    const gate = task ? gateFor(task, args) : null;
+    const candidate = typeof args.candidate === 'string' && args.candidate !== ''
+      ? args.candidate
+      : tryGit(['rev-parse', 'HEAD'], repo.root);
+    const candidateRevision = candidate ? `git:${candidate.replace(/^git:/, '')}` : null;
+    const review = task ? ledger.reviewStateFor(session.sessionId, task.frozen.taskId, { candidateRevision }) : null;
+    const validation = task
+      ? ledger.validationStateFor(session.sessionId, task.frozen.taskId, { gate, candidateRevision })
+      : null;
+
+    const decision = decide({ binding, session, task, freshness: { git, inputs }, handoffs, review, validation });
+    emit({
+      // The plan's §12 shape, verbatim and first: an Agent may read these five keys and
+      // nothing else, so they must mean exactly what the plan said they mean.
+      status: decision.status,
+      agent: binding ? binding.agentId : null,
+      session: session?.sessionId ?? null,
+      task: task?.frozen.taskId ?? null,
+      freshness: { git: git.state, inputs: inputs.state },
+      nextAction: decision.nextAction,
+      // Everything the decision rested on, so a surprising answer can be argued with rather
+      // than only obeyed. `reasons[0]` is the one that chose `nextAction`.
+      reasons: decision.reasons,
+      detail: {
+        role: binding?.role ?? null,
+        taskStatus: task?.state.status ?? null,
+        generation: task?.state.generation ?? null,
+        inputSnapshotDigest: task?.inputSnapshotDigest ?? null,
+        git: { ...git, target, targetCommit, baseRevision: base, baseIsAncestor },
+        inputs,
+        candidateRevision,
+        unackedHandoffs: handoffs.map((row) => ({ handoffId: row.handoffId, from: row.from, nextAction: row.nextAction, stale: row.stale })),
+        review: review === null ? null : { status: review.status, reviewId: review.reviewId, applies: review.applies, reasons: review.reasons, unresolvedFindings: review.unresolvedFindings },
+        validation: validation === null ? null : { gate: validation.gate, status: validation.status, required: validation.required, passed: validation.passed, failed: validation.failed, unknown: validation.unknown },
+      },
+    });
+  });
+}
+
+/**
+ * `teamctl metrics` — §14's counters, and the ones nothing records named rather than zeroed.
+ *
+ * See `src/metrics.mjs` for why an unavailable metric is listed instead of printed as 0: the
+ * criterion §14 ends on is whether the user still has to direct traffic, and a counter that
+ * reads zero because nothing observes it looks exactly like having succeeded at that.
+ */
+function metricsCommand(args) {
+  const { ledger } = ledgerFor(args, { actorRequired: false });
+  runLedger(() => {
+    emit(collectMetrics(ledger, {
+      sessionId: typeof args.session === 'string' && args.session !== '' ? args.session : null,
+    }));
+  });
+}
+
 function usage() {
   console.log(`Persistent Agent Team helper\n\n` +
     `Identity:\n` +
@@ -926,8 +1119,22 @@ function usage() {
     `  Capabilities are established by exercising them, never by reading docs; what cannot be\n` +
     `  established reads unknown, and an unknown capability withholds its fields rather than\n` +
     `  risking a field spec-suite would accept silently and never read.\n\n` +
+    `Recovery and measurement:\n` +
+    `  reconcile          [--session <id>] [--task <id>] [--gate <gate>] [--candidate <revision>]\n` +
+    `                     [--canonical-inputs <file>]\n` +
+    `  The first command to run after a context compaction: it answers where this agent is and\n` +
+    `  the one thing to do next, from the ledger rather than from memory. Freshness is three-\n` +
+    `  valued; --canonical-inputs takes [{ id, revision }] from whoever can ask the canonical\n` +
+    `  authority, because this layer holds input ids and not the locations they live at, and an\n` +
+    `  input nobody asked about reads unknown instead of fresh.\n` +
+    `  metrics            [--session <id>]\n` +
+    `  Counted from the sealed event log, never from directory scans, so a truncated log refuses\n` +
+    `  rather than reporting a smaller number. What nothing records is listed in unavailable with\n` +
+    `  the reason, because a metric printed as 0 looks exactly like having succeeded at it.\n\n` +
     `  spec-suite caps:  ${SPEC_SUITE_CAPABILITIES.join(', ')}\n` +
     `  next action:      ${HANDOFF_ACTIONS.join(', ')}\n` +
+    `  reconcile status: ${RECONCILE_STATUSES.join(', ')}\n` +
+    `  reconcile action: ${NEXT_ACTIONS.join(', ')}   (in precedence order)\n` +
     `  session status:   ${SESSION_STATUSES.join(', ')}\n` +
     `  task status:      ${TASK_STATUSES.join(', ')}\n` +
     `  review status:    ${REVIEW_STATUSES.join(', ')}\n` +
@@ -957,4 +1164,6 @@ else if (command === 'inbox') inbox(args);
 else if (command === 'review') reviewCommand(args);
 else if (command === 'validate') validateCommand(args);
 else if (command === 'project-spec-task') projectSpecTaskCommand(args);
+else if (command === 'reconcile') reconcileCommand(args);
+else if (command === 'metrics') metricsCommand(args);
 else die(`unknown command ${command}`);
