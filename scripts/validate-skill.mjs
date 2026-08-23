@@ -20,7 +20,10 @@ const required = [
   'schemas/revision.schema.json', 'schemas/digest.schema.json', 'schemas/git-revision.schema.json',
   'schemas/session-status.schema.json', 'schemas/task-status.schema.json',
   'schemas/handoff.schema.json', 'schemas/handoff-action.schema.json',
+  'schemas/review-decision.schema.json', 'schemas/review-status.schema.json',
+  'schemas/finding-severity.schema.json', 'schemas/finding-status.schema.json',
   'templates/handoff.md', 'templates/handoff.json', 'templates/task-packet.json', 'templates/finding.json',
+  'templates/review-decision.json',
   'scripts/teamctl.mjs', 'src/ledger.mjs', 'src/slug.mjs', 'src/digest.mjs', 'src/schema.mjs'
 ];
 for (const file of required) ok(fs.existsSync(path.join(ROOT, file)), `missing ${file}`);
@@ -43,6 +46,9 @@ const GENERATED = {
   'schemas/session-status.schema.json': 'src/ledger.mjs SESSION_STATUSES',
   'schemas/task-status.schema.json': 'src/ledger.mjs TASK_STATUSES',
   'schemas/handoff-action.schema.json': 'src/ledger.mjs HANDOFF_ACTIONS',
+  'schemas/review-status.schema.json': 'src/ledger.mjs REVIEW_STATUSES',
+  'schemas/finding-severity.schema.json': 'src/ledger.mjs FINDING_SEVERITIES',
+  'schemas/finding-status.schema.json': 'src/ledger.mjs FINDING_STATUSES',
 };
 for (const [file, source] of Object.entries(GENERATED)) {
   if (!fs.existsSync(path.join(ROOT, file))) continue;
@@ -53,7 +59,7 @@ for (const [file, source] of Object.entries(GENERATED)) {
 
 const HAND_WRITTEN = ['schemas/identity.schema.json', 'schemas/task-packet.schema.json',
   'schemas/finding.schema.json', 'schemas/session.schema.json', 'schemas/task-record.schema.json',
-  'schemas/handoff.schema.json'];
+  'schemas/handoff.schema.json', 'schemas/review-decision.schema.json'];
 for (const file of HAND_WRITTEN) {
   if (!fs.existsSync(path.join(ROOT, file))) continue;
   const body = text(file);
@@ -163,11 +169,73 @@ for (const [name, node] of [
 
 JSON.parse(text('templates/handoff.json'));
 
-const findingSchema = JSON.parse(text('schemas/finding.schema.json'));ok(findingSchema.properties.severity.enum.includes('blocker'), 'finding severity lacks blocker');
+/**
+ * An approval binds three things, and all three have to be structurally required
+ * (plan §5). The interesting assertion is the absence: nothing in this schema may
+ * record whether a decision is still current.
+ *
+ * A `stale` field would be a fact with an expiry date. It is true when written and
+ * silently wrong the moment the candidate moves, because the thing that moved is a
+ * git commit and it has no way to reach back into a JSON file and correct it. Every
+ * later reader then trusts a flag that says "fresh" about work nobody approved.
+ * Applicability is therefore derived on read (`reviewStateFor`), and the way to keep
+ * it derived is to leave nowhere to store it.
+ *
+ * The digest split is checked for the reason it is on handoffs, with one addition:
+ * `seq` sits outside the statement, so recording the same judgement twice yields the
+ * same digest and reads as a duplicate rather than as two independent approvals.
+ */
+const reviewSchema = JSON.parse(text('schemas/review-decision.schema.json'));
+const decision = reviewSchema.properties.decision;
+ok(reviewSchema.additionalProperties === false, 'review record must be closed');
+ok(decision?.additionalProperties === false, 'the review decision must be closed');
+ok(reviewSchema.properties.decisionDigest?.$ref === 'digest.schema.json',
+  'decisionDigest must $ref digest.schema.json');
+for (const circumstance of ['reviewId', 'seq', 'recordedAt', 'recordedBy', 'decisionDigest']) {
+  ok(!Object.keys(decision?.properties ?? {}).includes(circumstance),
+    `${circumstance} is circumstance, not judgement; it must sit outside the digested half`);
+}
+for (const field of ['taskId', 'reviewer', 'candidateRevision', 'inputSnapshotDigest', 'status',
+  'findings', 'summary']) {
+  ok(decision?.required?.includes(field), `a review decision must require ${field}`);
+}
+for (const derived of ['stale', 'applies', 'current', 'isCurrent']) {
+  ok(!JSON.stringify(reviewSchema).includes(`"${derived}"`),
+    `review decisions must not store ${derived}: applicability is derived on read, and a stored copy stops being true the moment the candidate moves`);
+}
+ok(decision.properties.status?.$ref === 'review-status.schema.json',
+  'review status must $ref the generated enum rather than inlining one');
+ok(decision.properties.findings?.items?.$ref === 'finding.schema.json',
+  'review findings must $ref finding.schema.json');
+// Any revision scheme, not git only: plan §13 wants to name the candidate by a
+// digest of its work product so a rebase that changes no substance stops throwing
+// the review away, and pinning git here would make that a schema version bump.
+ok(decision.properties.candidateRevision?.$ref === 'revision.schema.json',
+  'candidateRevision must $ref revision.schema.json so the naming scheme can change without a version bump');
+ok(typeof decision.properties.summary?.maxLength === 'number',
+  'review summary must be length-capped: a decision, not the deliberation');
+
+/**
+ * The finding vocabularies must be references, not copies.
+ *
+ * `recordReview` refuses to approve over an unresolved blocker by comparing against
+ * FINDING_SEVERITIES/FINDING_STATUSES in src/ledger.mjs. If this schema kept its own
+ * list, the day someone added a status to the schema alone would be the day findings
+ * carrying it validated fine and then passed straight through every consistency
+ * check, because the ledger would not recognise the value as outstanding.
+ */
+const findingSchema = JSON.parse(text('schemas/finding.schema.json'));
+ok(findingSchema.properties.severity?.$ref === 'finding-severity.schema.json',
+  'finding severity must $ref the generated enum, not inline one');
+ok(findingSchema.properties.status?.$ref === 'finding-status.schema.json',
+  'finding status must $ref the generated enum, not inline one');
+ok(JSON.parse(text('schemas/finding-severity.schema.json')).enum.includes('blocker'),
+  'finding severity lacks blocker');
 ok(findingSchema.required.includes('evidence') && findingSchema.required.includes('impact'), 'finding must require evidence + impact');
 
 JSON.parse(text('templates/task-packet.json'));
 JSON.parse(text('templates/finding.json'));
+JSON.parse(text('templates/review-decision.json'));
 
 const reviewer = text('roles/reviewer.md');
 ok(/not a second implementer/i.test(reviewer), 'reviewer must remain independent');

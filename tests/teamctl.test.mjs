@@ -341,6 +341,11 @@ test('status answers "where am I?" from the binding alone', () => {
 
   const out = JSON.parse(run(['status'], f).stdout);
   assert.equal(out.agent.agentId, 'fullstack-01');
+  // The role too, and it is read through the binding rather than out of it: the
+  // binding file deliberately carries no role, so a `status` that read the file
+  // directly would report `undefined` here and look merely incomplete instead of
+  // wrong — which is how it went unnoticed until this line existed.
+  assert.equal(out.agent.role, 'fullstack');
   assert.deepEqual(out.sessions.map((s) => s.sessionId), ['feature:coupon']);
   // Only this Agent's own tasks: a recovering Agent that is handed the whole
   // session has to work out which rows are its own, and that is the one question
@@ -510,4 +515,157 @@ test('the shipped handoff template publishes with only its ids filled in', () =>
   const published = JSON.parse(run(['handoff', 'publish', '--handoff', 'draft.json'], f).stdout);
   assert.equal(published.seq, 1);
   assert.ok(published.handoffDigest.startsWith('sha256:'));
+});
+
+// --------------------------------------------------------------------- reviews
+
+/**
+ * `review state` across two worktrees, which is where the answer has to be right:
+ * the reviewer records the decision, and the *implementer* is who later asks whether
+ * it still covers what they now have.
+ *
+ * The candidate defaulting to this worktree's HEAD is the part only the CLI owns.
+ * Asking "is what I have now approved?" is the real question, and requiring the
+ * caller to paste a revision invites pasting the one that was approved — which turns
+ * a staleness check into a tautology.
+ */
+test('a review crosses worktrees and its applicability follows the candidate', () => {
+  const f = bootstrapped({ agentId: 'fullstack-01', role: 'fullstack' });
+  run(['session', 'start', '--session', 'feature:coupon', '--target', 'main'], f);
+  writePacket(f, taskPacket());
+  run(['task', 'issue', '--packet', 'packet.json'], f);
+
+  const linked = path.join(f.dir, 'wt-reviewer');
+  git(['worktree', 'add', linked, '-b', 'review'], f.repo);
+  const g = { dir: f.dir, repo: linked, home: f.home };
+  run(['setup', '--agent-id', 'reviewer-01', '--role', 'reviewer', '--harness', 'codex', '--repo', linked], g);
+
+  const head = `git:${git(['rev-parse', 'HEAD'], f.repo)}`;
+  writeDraft(g, {
+    sessionId: 'feature:coupon', taskId: 'task:coupon-api', status: 'approved',
+    candidateRevision: head, requirementsRevision: `sha256:${'1'.repeat(64)}`,
+    summary: 'AC-1 holds; the discount is applied in the domain layer.',
+    validationEvidence: ['npm test'],
+  }, 'review.json');
+  const recorded = JSON.parse(run(['review', 'record', '--review', 'review.json'], g).stdout);
+  assert.equal(recorded.reviewId, 'review:coupon-api-1');
+  // The reviewer came from the binding, like a handoff's `from`: a decision whose
+  // author is whatever was typed is one anyone can attribute to anyone.
+  assert.deepEqual(recorded.decision.reviewer, { subject: 'agent:reviewer-01', role: 'reviewer' });
+
+  // The implementer asks about its own HEAD without naming it, and both worktrees
+  // are on the same commit, so the approval covers what it has.
+  const fresh = JSON.parse(run(['review', 'state', '--session', 'feature:coupon',
+    '--task', 'task:coupon-api'], f).stdout);
+  assert.deepEqual([fresh.status, fresh.applies, fresh.reasons], ['approved', true, []]);
+  assert.equal(fresh.current.candidateRevision, head, 'the answer says which candidate it is about');
+
+  // Then it commits, and the same command — unchanged, still naming no revision —
+  // reports that the approval no longer covers what it has (plan §17 Scenario 5).
+  fs.writeFileSync(path.join(f.repo, 'coupon.md'), '# coupon\n');
+  git(['add', 'coupon.md'], f.repo);
+  git(['commit', '-m', 'coupon domain rule'], f.repo);
+  const moved = JSON.parse(run(['review', 'state', '--session', 'feature:coupon',
+    '--task', 'task:coupon-api'], f).stdout);
+  assert.deepEqual([moved.applies, moved.reasons], [false, ['candidate-moved']]);
+  assert.equal(moved.observed.candidateRevision, head);
+
+  // An explicit --candidate still wins, so the approved revision can be named on
+  // purpose: "what did it approve?" is a different question from "does it still
+  // apply?", and both have to be askable.
+  assert.equal(JSON.parse(run(['review', 'state', '--session', 'feature:coupon',
+    '--task', 'task:coupon-api', '--candidate', head], f).stdout).applies, true);
+
+  const listed = JSON.parse(run(['review', 'show', '--session', 'feature:coupon'], f).stdout);
+  assert.deepEqual(listed.map((r) => r.reviewId), ['review:coupon-api-1']);
+  assert.equal(JSON.parse(run(['review', 'show', '--session', 'feature:coupon',
+    '--review', 'review:coupon-api-1'], f).stdout).decisionDigest, recorded.decisionDigest);
+
+  const events = JSON.parse(run(['session', 'events', '--session', 'feature:coupon'], f).stdout);
+  assert.deepEqual(events.filter((e) => e.kind === 'review-recorded')
+    .map((e) => [e.actor, e.actorRole, e.status]), [['agent:reviewer-01', 'reviewer', 'approved']]);
+});
+
+/**
+ * The refusals a reviewer will actually hit, as exit codes.
+ *
+ * All 3, none 4: none of these get better by being retried. A wrapper that read
+ * `REVIEW_SELF` as retryable would sit in a loop while the one thing that would fix
+ * it — a different agent — never happens.
+ */
+test('the CLI refuses reviews that would record a decision nobody could trust', () => {
+  const f = bootstrapped({ agentId: 'fullstack-01', role: 'fullstack' });
+  run(['session', 'start', '--session', 'feature:coupon', '--target', 'main'], f);
+  writePacket(f, taskPacket());
+  run(['task', 'issue', '--packet', 'packet.json'], f);
+  const head = `git:${git(['rev-parse', 'HEAD'], f.repo)}`;
+  const base = {
+    sessionId: 'feature:coupon', taskId: 'task:coupon-api', status: 'approved',
+    candidateRevision: head, requirementsRevision: `sha256:${'1'.repeat(64)}`,
+    summary: 'AC-1 holds.',
+  };
+
+  // From the implementer's own worktree: it owns the task, so it cannot review it,
+  // and the binding is what says so — there is no flag that talks it round.
+  writeDraft(f, base, 'review.json');
+  assert.deepEqual(refusal(['review', 'record', '--review', 'review.json'], f),
+    { code: 'REVIEW_SELF', exit: 3 });
+  assert.deepEqual(refusal(['review', 'record', '--review', 'review.json', '--role', 'reviewer'], f),
+    { code: 'REVIEW_SELF', exit: 3 });
+
+  const linked = path.join(f.dir, 'wt-reviewer');
+  git(['worktree', 'add', linked, '-b', 'review'], f.repo);
+  const g = { dir: f.dir, repo: linked, home: f.home };
+  run(['setup', '--agent-id', 'reviewer-01', '--role', 'reviewer', '--harness', 'codex', '--repo', linked], g);
+
+  for (const [name, over, expected] of [
+    ['a requirement the task never declared', { requirementsRevision: `sha256:${'9'.repeat(64)}` },
+      'REVIEW_REQUIREMENT_UNKNOWN'],
+    ['an approval naming no requirement', { requirementsRevision: undefined }, 'MALFORMED_REVIEW'],
+    ['an approval over an open blocker', {
+      findings: [{
+        schemaVersion: 1, findingId: 'FIND-001', severity: 'blocker', status: 'open',
+        candidateRevision: head, requirement: 'AC-1', location: 'src/coupon.ts:1',
+        evidence: 'Two coupons both apply.', impact: 'The total can go negative.',
+        requiredOutcome: 'At most one applies.',
+      }],
+    }, 'REVIEW_INCONSISTENT'],
+    ['a status the vocabulary does not have', { status: 'lgtm' }, 'UNKNOWN_REVIEW_STATUS'],
+    ['a field the ledger owns', { reviewer: { subject: 'agent:elsewhere', role: 'reviewer' } },
+      'MALFORMED_REVIEW'],
+  ]) {
+    writeDraft(g, { ...base, ...over }, 'review.json');
+    assert.deepEqual(refusal(['review', 'record', '--review', 'review.json'], g),
+      { code: expected, exit: 3 }, name);
+  }
+
+  // Nothing was recorded, so the next legitimate decision is still seq 1: a refusal
+  // that consumed a sequence number would leave a gap the event log cannot explain.
+  assert.deepEqual(JSON.parse(run(['review', 'show', '--session', 'feature:coupon'], g).stdout), []);
+  writeDraft(g, base, 'review.json');
+  assert.equal(JSON.parse(run(['review', 'record', '--review', 'review.json'], g).stdout).seq, 1);
+});
+
+/** The shipped template must record as-is, or it is documentation of a wish. */
+test('the shipped review template records with only its ids filled in', () => {
+  const f = bootstrapped({ agentId: 'fullstack-01', role: 'fullstack' });
+  const shipped = JSON.parse(fs.readFileSync(path.join(ROOT, 'templates', 'task-packet.json'), 'utf8'));
+  run(['session', 'start', '--session', shipped.sessionId, '--target', 'main'], f);
+  writePacket(f, shipped);
+  run(['task', 'issue', '--packet', 'packet.json'], f);
+
+  const linked = path.join(f.dir, 'wt-reviewer');
+  git(['worktree', 'add', linked, '-b', 'review'], f.repo);
+  const g = { dir: f.dir, repo: linked, home: f.home };
+  run(['setup', '--agent-id', 'reviewer-01', '--role', 'reviewer', '--harness', 'codex', '--repo', linked], g);
+
+  const template = JSON.parse(fs.readFileSync(path.join(ROOT, 'templates', 'review-decision.json'), 'utf8'));
+  writeDraft(g, { ...template, sessionId: shipped.sessionId, taskId: shipped.taskId }, 'review.json');
+  const recorded = JSON.parse(run(['review', 'record', '--review', 'review.json'], g).stdout);
+  assert.equal(recorded.seq, 1);
+  assert.ok(recorded.decisionDigest.startsWith('sha256:'));
+  // The template carries an open `minor` and still approved: only a blocker refuses,
+  // and the count is reported so the approval does not read as "nothing found".
+  assert.equal(JSON.parse(run(['review', 'state', '--session', shipped.sessionId,
+    '--task', shipped.taskId, '--candidate', template.candidateRevision], g).stdout).unresolvedFindings, 1);
 });

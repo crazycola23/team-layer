@@ -119,6 +119,10 @@ test('checked-in templates validate against their schemas', () => {
   const pairs = [
     ['templates/task-packet.json', 'schemas/task-packet.schema.json'],
     ['templates/finding.json', 'schemas/finding.schema.json'],
+    // Not a review record — the template is the draft, and the record is what
+    // `recordReview` returns. tests/ledger.test.mjs validates that half, and it has
+    // to be that way round: only the ledger can fill in the fields the schema
+    // requires, which is the point of them being required.
   ];
   for (const [instance, schema] of pairs) {
     const loaded = loadSchema(path.join(ROOT, schema));

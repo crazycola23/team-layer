@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
 import { roleIds, isRole, roleFile, roleVersion } from '../src/roles.mjs';
-import { Ledger, LedgerError, SESSION_STATUSES, TASK_STATUSES, HANDOFF_ACTIONS } from '../src/ledger.mjs';
+import { Ledger, LedgerError, SESSION_STATUSES, TASK_STATUSES, HANDOFF_ACTIONS, REVIEW_STATUSES } from '../src/ledger.mjs';
 import { SlugError } from '../src/slug.mjs';
 import { DigestError } from '../src/digest.mjs';
 
@@ -551,8 +551,7 @@ function taskCommand(args) {
  */
 function status(args) {
   const { repo, ledger } = ledgerFor(args);
-  const bindingPath = path.join(repo.root, '.agent-team-binding.json');
-  const binding = fs.existsSync(bindingPath) ? readJson(bindingPath) : null;
+  const binding = bindingFor(repo);
   const subject = binding ? `agent:${binding.agentId}` : null;
 
   runLedger(() => {
@@ -659,6 +658,39 @@ function inbox(args) {
   });
 }
 
+function reviewCommand(args) {
+  const sub = args._[1];
+  const { repo, ledger } = ledgerFor(args);
+  const binding = bindingFor(repo);
+  runLedger(() => {
+    if (sub === 'record') {
+      const draft = readJson(path.resolve(requireFlag(args, 'review')));
+      const sessionId = typeof args.session === 'string' ? args.session : draft.sessionId;
+      if (!sessionId) die('--session is required when the draft does not name one');
+      emit(ledger.recordReview({ sessionId, draft, actorRole: roleFor(binding, args) }));
+    } else if (sub === 'show') {
+      const sessionId = requireFlag(args, 'session');
+      if (typeof args.review === 'string') {
+        emit(ledger.readReview(sessionId, args.review));
+        return;
+      }
+      emit(ledger.listReviews(sessionId));
+    } else if (sub === 'state') {
+      // The candidate defaults to this worktree's HEAD, because "is what I have now
+      // approved?" is the question being asked in practice, and making the caller
+      // paste a revision invites pasting the one that was approved. It is echoed
+      // back in `current` so the answer says which candidate it is about.
+      const candidateRevision = typeof args.candidate === 'string' && args.candidate !== ''
+        ? args.candidate
+        : `git:${git(['rev-parse', 'HEAD'], repo.root)}`;
+      emit(ledger.reviewStateFor(requireFlag(args, 'session'), requireFlag(args, 'task'),
+        { candidateRevision }));
+    } else {
+      die(`unknown review subcommand ${sub ?? '(none)'}`);
+    }
+  });
+}
+
 function usage() {
   console.log(`Persistent Agent Team helper\n\n` +
     `Identity:\n` +
@@ -681,9 +713,14 @@ function usage() {
     `  handoff publish    --handoff <draft.json> [--session <id>]\n` +
     `  handoff ack        --session <id> --handoff <handoff-id>\n` +
     `  handoff show       --session <id> [--handoff <handoff-id>]\n\n` +
+    `Review decisions (approval binds candidate + inputs + requirement, so it can go stale):\n` +
+    `  review record      --review <decision.json> [--session <id>]\n` +
+    `  review show        --session <id> [--review <review-id>]\n` +
+    `  review state       --session <id> --task <id> [--candidate <revision>]   Does the latest decision still apply?\n\n` +
     `  next action:    ${HANDOFF_ACTIONS.join(', ')}\n` +
     `  session status: ${SESSION_STATUSES.join(', ')}\n` +
-    `  task status:    ${TASK_STATUSES.join(', ')}\n\n` +
+    `  task status:    ${TASK_STATUSES.join(', ')}\n` +
+    `  review status:  ${REVIEW_STATUSES.join(', ')}\n\n` +
     `Exit codes:\n` +
     `  0 ok   1 usage error   2 unhealthy (doctor)   3 ledger refused   4 refused but retryable (re-read, retry)\n\n` +
     `Environment:\n` +
@@ -704,4 +741,5 @@ else if (command === 'session') sessionCommand(args);
 else if (command === 'task') taskCommand(args);
 else if (command === 'handoff') handoffCommand(args);
 else if (command === 'inbox') inbox(args);
+else if (command === 'review') reviewCommand(args);
 else die(`unknown command ${command}`);

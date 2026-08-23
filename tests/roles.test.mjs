@@ -18,12 +18,29 @@ test('the registry is the only place the role list is written down', () => {
   assert.equal(generated['x-generated-from'], `roles/registry.json@${registryDigest()}`);
 
   // No other schema may restate the enum; they must $ref role.schema.json.
+  //
+  // Asked structurally rather than by substring, because a substring search cannot
+  // tell a restated value from a field name: review-decision.schema.json has a
+  // property *named* `reviewer`, which is not a second copy of the vocabulary and
+  // renaming it to satisfy a text search would make the schema worse. Walking for
+  // `enum`/`const` asks the real question — is the role list written down twice —
+  // and asks it at any depth, which the old check did not.
   const schemaDir = path.join(ROOT, 'schemas');
-  for (const name of fs.readdirSync(schemaDir).filter((f) => f.endsWith('.json') && f !== 'role.schema.json')) {
-    const body = fs.readFileSync(path.join(schemaDir, name), 'utf8');
-    for (const id of ids) {
-      assert.ok(!body.includes(`"${id}"`), `${name} restates role ${id}; use {"$ref": "role.schema.json"}`);
+  const roleSet = new Set(ids);
+  const restated = (node, where) => {
+    if (Array.isArray(node)) return node.flatMap((item, i) => restated(item, `${where}[${i}]`));
+    if (!node || typeof node !== 'object') return [];
+    const hits = [];
+    if (Array.isArray(node.enum) && node.enum.some((value) => roleSet.has(value))) hits.push(`${where}.enum`);
+    if (roleSet.has(node.const)) hits.push(`${where}.const`);
+    for (const [key, value] of Object.entries(node)) {
+      if (key !== 'enum' && key !== 'const') hits.push(...restated(value, `${where}.${key}`));
     }
+    return hits;
+  };
+  for (const name of fs.readdirSync(schemaDir).filter((f) => f.endsWith('.json') && f !== 'role.schema.json')) {
+    const hits = restated(JSON.parse(fs.readFileSync(path.join(schemaDir, name), 'utf8')), '$');
+    assert.deepEqual(hits, [], `${name} restates the role list at ${hits.join(', ')}; use {"$ref": "role.schema.json"}`);
   }
 
   // teamctl must not carry a second hardcoded list either.

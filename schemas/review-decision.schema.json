@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/crazycola23/team-layer/schemas/review-decision.schema.json",
+  "title": "Review Decision",
+  "description": "One review of one candidate of one task (plan §5), recorded as a first-class artifact rather than as a pile of findings.\n\nAn approval binds three things at once: the exact candidate reviewed, the exact semantic input snapshot it was reviewed against, and the exact requirement revision it was judged by. All three are load-bearing. An approval naming only the candidate survives the contract changing underneath it, which is how work gets merged against requirements nobody approved it against; one naming only the inputs survives the code being rewritten.\n\nStaleness is deliberately absent from this file. Whether a decision still applies is derived by comparing it against current truth (`reviewStateFor` in src/ledger.mjs) — a stored `stale` flag would be a fact that stops being true the moment the candidate moves, and nobody goes back to update it. That is precisely the failure plan §17 Scenario 5 describes.\n\nA decision is evidence, not a gate pass. Recording one moves neither the task nor the session: the reviewer's judgement is one input to the merge gate, which still owes its own structural checks (plan §5, final line).\n\nThe two halves mirror handoff.schema.json. `decision` is the statement and is content-addressed by `decisionDigest`; `seq`, `recordedAt` and `recordedBy` are circumstance and live outside it, so that recording the same judgement twice is detectable instead of looking like two independent approvals.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "seq", "reviewId", "decision", "decisionDigest", "recordedAt", "recordedBy"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "reviewId": {
+      "description": "Assigned by the ledger as review:<task-name>-<seq>. Outside the digested half because it embeds the sequence number, which is circumstance: two byte-identical judgements must hash identically.",
+      "$ref": "id.schema.json"
+    },
+    "seq": {
+      "description": "Position in this session's review order, assigned under the session lock. Reviews of different tasks interleave, so this is the only total ordering available.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "decisionDigest": { "$ref": "digest.schema.json" },
+    "recordedAt": { "$ref": "timestamp.schema.json" },
+    "recordedBy": { "$ref": "id.schema.json" },
+    "decision": {
+      "description": "The judgement itself: substance only, so its digest identifies what was decided and nothing about the act of recording it.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sessionId", "taskId", "reviewer", "candidateRevision", "inputSnapshotDigest", "status", "findings", "validationEvidence", "summary"],
+      "properties": {
+        "sessionId": { "$ref": "id.schema.json" },
+        "taskId": { "$ref": "id.schema.json" },
+        "reviewer": {
+          "description": "Who judged, and in what capacity. Inside the digest: an approval is only worth what its author is, so the author is part of the statement rather than metadata about it.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["subject", "role"],
+          "properties": {
+            "subject": { "$ref": "id.schema.json" },
+            "role": { "$ref": "role.schema.json" }
+          }
+        },
+        "candidateRevision": {
+          "description": "Exactly what was reviewed. Any revision scheme, not only git: plan §13 anticipates replacing the commit name with a work-product digest so that a rebase which changes no substance does not discard the review, and that should not need a schema version.",
+          "$ref": "revision.schema.json"
+        },
+        "inputSnapshotDigest": {
+          "description": "The task's input snapshot at review time. Copied from the task rather than asserted by the reviewer, so it cannot describe a snapshot the review was not actually made against.",
+          "$ref": "digest.schema.json"
+        },
+        "requirementsRevision": {
+          "description": "The requirement or contract revision the candidate was judged by. Required for `approved` and checked against the task's declared inputs: an approval anchored to a revision the task never depended on could not go stale when the real requirement moved, so accepting an unchecked string here would give the binding only the appearance of being enforced. Optional for the other statuses — asking for changes does not stop being the right answer when the contract moves.",
+          "$ref": "revision.schema.json"
+        },
+        "status": { "$ref": "review-status.schema.json" },
+        "findings": {
+          "description": "What the reviewer found. Checked against `status` when recorded: approving over an unresolved blocker, requesting changes with nothing outstanding, or blocking without naming the open requirement question are all refused, because a decision that contradicts its own evidence leaves every later reader guessing which half to believe.",
+          "type": "array",
+          "items": { "$ref": "finding.schema.json" }
+        },
+        "validationEvidence": {
+          "description": "Ids of validation evidence the reviewer relied on. Present so that an approval says what it was standing on; it does not substitute for running the checks, and an empty list is an honest statement that the judgement was by inspection alone.",
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "summary": {
+          "description": "The judgement in the reviewer's words. Capped: this is the field a review transcript would land in, and the recipient needs the decision, not the deliberation.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 600
+        }
+      }
+    }
+  }
+}

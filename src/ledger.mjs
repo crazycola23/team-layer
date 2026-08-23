@@ -108,6 +108,49 @@ const HANDOFF_DERIVED = ['handoffId', 'seq', 'from', 'publishedAt', 'publishedBy
 const HANDOFF_DRAFT_FIELDS = new Set(['$comment', 'sessionId', 'taskId', 'to', 'nextAction',
   'summary', 'baseRevision', 'artifacts', 'evidence', 'unresolved', 'inputSnapshotDigest']);
 
+/**
+ * What a review can conclude (plan §5).
+ *
+ * Narrower than the finding statuses on purpose: a decision answers one question —
+ * may this candidate proceed — and the three answers are yes, no-and-here-is-what-
+ * to-fix, and no-for-a-reason-the-reviewer-cannot-fix. The last is a separate
+ * status rather than a severity because it routes differently: `changes-requested`
+ * goes back to the implementer, `blocked-unresolved` goes to whoever owns the
+ * requirement, and collapsing them makes the implementer the one who has to work
+ * out that the ball is not in their court.
+ */
+export const REVIEW_STATUSES = ['approved', 'changes-requested', 'blocked-unresolved'];
+
+/**
+ * Finding vocabulary, hoisted here from finding.schema.json so there is one
+ * authority rather than two.
+ *
+ * `recordReview` checks a decision against its own findings — approving over an
+ * open blocker is a self-contradiction — and a check that compared against a
+ * privately retyped copy of these lists would start passing the day the schema
+ * gained a status this file had never heard of.
+ */
+export const FINDING_SEVERITIES = ['blocker', 'major', 'minor', 'note'];
+export const FINDING_STATUSES = ['open', 'fixed', 'verified', 'closed',
+  'rejected-with-evidence', 'accepted-risk', 'unresolved-product'];
+
+/**
+ * Finding statuses that mean the finding is still outstanding.
+ *
+ * `fixed` is not here: it is the implementer's claim, and a reviewer looking at a
+ * fixed finding either verifies it or does not — both of which move it out of this
+ * set — so counting it as outstanding would block approvals that have already done
+ * the work of resolving it.
+ */
+const FINDING_UNRESOLVED = new Set(['open', 'unresolved-product']);
+
+/** Fields of a decision the ledger assigns. Same contract as HANDOFF_DERIVED. */
+const REVIEW_DERIVED = ['reviewId', 'seq', 'reviewer', 'recordedAt', 'recordedBy', 'decisionDigest'];
+
+/** What a review draft may set. Closed for the same reason a handoff draft is. */
+const REVIEW_DRAFT_FIELDS = new Set(['$comment', 'sessionId', 'taskId', 'candidateRevision',
+  'inputSnapshotDigest', 'requirementsRevision', 'status', 'findings', 'validationEvidence', 'summary']);
+
 export const TASK_TRANSITIONS = {
   issued: ['in-progress', 'blocked', 'cancelled'],
   'in-progress': ['completed', 'blocked', 'cancelled'],
@@ -384,6 +427,7 @@ export class Ledger {
         updatedAt: at,
         eventSeq: 0,
         handoffSeq: 0,
+        reviewSeq: 0,
         ...(canonicalProvider ? { canonicalProvider } : {}),
         ...(notes ? { notes } : {}),
       };
@@ -713,7 +757,8 @@ export class Ledger {
       }
     }
     const taskId = draft.taskId;
-    assertId(taskId, 'draft.taskId');    if (draft.sessionId !== undefined && draft.sessionId !== sessionId) {
+    assertId(taskId, 'draft.taskId');
+    if (draft.sessionId !== undefined && draft.sessionId !== sessionId) {
       throw new LedgerError('SESSION_MISMATCH',
         `draft.sessionId ${JSON.stringify(draft.sessionId)} is not ${sessionId}`);
     }
@@ -956,4 +1001,308 @@ export class Ledger {
     }
     return rows;
   }
+  // --------------------------------------------------------------------- reviews
+
+  reviewsDir(sessionId) {
+    return path.join(this.sessionDir(sessionId), 'reviews');
+  }
+
+  reviewFile(sessionId, reviewId) {
+    return path.join(this.reviewsDir(sessionId), `${slug(reviewId, 'reviewId')}.json`);
+  }
+
+  /** Every review decision in the session, oldest first. */
+  listReviews(sessionId) {
+    const dir = this.reviewsDir(sessionId);
+    if (!fs.existsSync(dir)) return [];
+    return fs.readdirSync(dir)
+      .filter((name) => name.endsWith('.json'))
+      .map((name) => this.readReview(sessionId, unslug(name.slice(0, -'.json'.length))))
+      .sort((a, b) => a.seq - b.seq);
+  }
+
+  /**
+   * Read a decision, proving it has not been edited since it was recorded.
+   *
+   * A review decision is an authorisation: something downstream asks it whether this
+   * candidate may proceed. An approval that can be edited on disk is an approval
+   * anyone can manufacture, so the digest is checked on every read rather than
+   * offered as a separate `verify` command nobody would run.
+   */
+  readReview(sessionId, reviewId) {
+    assertId(sessionId, 'sessionId');
+    assertId(reviewId, 'reviewId');
+    const file = this.reviewFile(sessionId, reviewId);
+    const record = readJson(file, `review ${reviewId}`);
+    const actual = jsonDigest(record.decision);
+    if (actual !== record.decisionDigest) {
+      throw new LedgerError(
+        'REVIEW_TAMPERED',
+        `review ${reviewId} does not match its recorded digest; it was edited after being recorded. ` +
+          'Record a new decision instead of trusting this file.',
+        { file, recorded: record.decisionDigest, actual },
+      );
+    }
+    return record;
+  }
+
+  /**
+   * Record a review decision against one candidate of one task (plan §5).
+   *
+   * An approval binds three things at once: the exact candidate reviewed, the exact
+   * semantic input snapshot it was reviewed against, and the exact requirement
+   * revision it was judged by. All three are load-bearing — an approval that named
+   * only the candidate would survive the contract changing underneath it, which is
+   * how work gets merged against requirements nobody approved it against.
+   *
+   * Nothing here moves the task or the session. An approval is semantic evidence,
+   * not a gate pass: it says a human-equivalent judgement was made, and the merge
+   * gate still owes its own structural checks (plan §5, last line). Recording a
+   * decision that also advanced the task would make the reviewer's opinion
+   * sufficient, which is exactly the bypass that sentence forbids.
+   */
+  recordReview({ sessionId, draft, actor = this.actor, actorRole }) {
+    assertId(sessionId, 'sessionId');
+    if (!draft || typeof draft !== 'object' || Array.isArray(draft)) {
+      throw new LedgerError('MALFORMED_REVIEW', 'a review draft must be an object');
+    }
+    for (const field of REVIEW_DERIVED) {
+      if (draft[field] !== undefined) {
+        throw new LedgerError('MALFORMED_REVIEW',
+          `${field} is assigned by the ledger; remove it from the draft`);
+      }
+    }
+    for (const field of Object.keys(draft)) {
+      if (!REVIEW_DRAFT_FIELDS.has(field)) {
+        throw new LedgerError('MALFORMED_REVIEW',
+          `${field} is not a review field; a misspelled field would record a decision with silently missing content`);
+      }
+    }
+    const taskId = draft.taskId;
+    assertId(taskId, 'draft.taskId');
+    if (draft.sessionId !== undefined && draft.sessionId !== sessionId) {
+      throw new LedgerError('SESSION_MISMATCH',
+        `draft.sessionId ${JSON.stringify(draft.sessionId)} is not ${sessionId}`);
+    }
+    if (!isRole(actorRole)) {
+      throw new LedgerError('UNKNOWN_ROLE',
+        `the reviewing role ${JSON.stringify(actorRole)} is not a known role; expected ${roleIds().join(', ')}`);
+    }
+    // A distinct code from MALFORMED_REVIEW for the same reason UNKNOWN_ACTION is
+    // distinct: a misspelled status is a fixable typo, not a shape error.
+    if (!REVIEW_STATUSES.includes(draft.status)) {
+      throw new LedgerError('UNKNOWN_REVIEW_STATUS',
+        `status must be one of ${REVIEW_STATUSES.join(', ')}, got ${JSON.stringify(draft.status)}`);
+    }
+    assertRevision(draft.candidateRevision, 'candidateRevision');
+    if (draft.requirementsRevision !== undefined) {
+      assertRevision(draft.requirementsRevision, 'requirementsRevision');
+    }
+    if (typeof draft.summary !== 'string' || draft.summary.trim() === '') {
+      throw new LedgerError('MALFORMED_REVIEW', 'a review decision requires a non-empty summary');
+    }
+    const findings = draft.findings ?? [];
+    if (!Array.isArray(findings)) {
+      throw new LedgerError('MALFORMED_REVIEW', 'findings must be an array');
+    }
+    findings.forEach((finding, index) => {
+      const at = `findings[${index}]`;
+      if (!finding || typeof finding !== 'object' || Array.isArray(finding)) {
+        throw new LedgerError('MALFORMED_REVIEW', `${at} must be an object`);
+      }
+      // Only the two fields this method reasons about are checked here; the full
+      // finding shape is finding.schema.json's business. Checking these two is not
+      // optional though: the status/findings consistency rules below are what stop
+      // an approval contradicting its own evidence, and a finding with a severity
+      // this code does not recognise would slip through every one of them.
+      if (!FINDING_SEVERITIES.includes(finding.severity)) {
+        throw new LedgerError('MALFORMED_REVIEW',
+          `${at}.severity must be one of ${FINDING_SEVERITIES.join(', ')}, got ${JSON.stringify(finding.severity)}`);
+      }
+      if (!FINDING_STATUSES.includes(finding.status)) {
+        throw new LedgerError('MALFORMED_REVIEW',
+          `${at}.status must be one of ${FINDING_STATUSES.join(', ')}, got ${JSON.stringify(finding.status)}`);
+      }
+    });
+    const validationEvidence = draft.validationEvidence ?? [];
+    if (!Array.isArray(validationEvidence)
+      || validationEvidence.some((id) => typeof id !== 'string' || id.trim() === '')) {
+      throw new LedgerError('MALFORMED_REVIEW', 'validationEvidence must be an array of non-empty ids');
+    }
+
+    const unresolved = findings.filter((f) => FINDING_UNRESOLVED.has(f.status));
+    // A decision that contradicts its own findings is the review equivalent of a
+    // task whose frozen half disagrees with its digest: internally inconsistent
+    // frozen truth, which every later reader has to guess its way past.
+    if (draft.status === 'approved') {
+      const blocking = unresolved.filter((f) => f.severity === 'blocker');
+      if (blocking.length) {
+        throw new LedgerError('REVIEW_INCONSISTENT',
+          `cannot approve with ${blocking.length} unresolved blocker finding(s): ` +
+            `${blocking.map((f) => f.findingId ?? '(unnamed)').join(', ')}. ` +
+            'Resolve them, downgrade them honestly, or request changes.',
+          { findings: blocking.map((f) => f.findingId ?? null) });
+      }
+      // Only `blocker` blocks. An unresolved `major` is a judgement call, and
+      // refusing the approval here would not produce better reviews — it would
+      // produce majors relabelled as minors, which destroys the signal instead of
+      // the ambiguity.
+    } else if (draft.status === 'changes-requested' && unresolved.length === 0) {
+      throw new LedgerError('REVIEW_INCONSISTENT',
+        'changes-requested with no unresolved finding gives the implementer nothing to act on; ' +
+          'record the findings, or use blocked-unresolved if the obstacle is not theirs to fix');
+    } else if (draft.status === 'blocked-unresolved'
+      && !findings.some((f) => f.status === 'unresolved-product')) {
+      throw new LedgerError('REVIEW_INCONSISTENT',
+        'blocked-unresolved means a requirement question is open, so at least one finding must be ' +
+          'status unresolved-product naming it; otherwise nobody knows who is being asked what');
+    }
+
+    return this.withLock(sessionId, () => {
+      const session = this.readSession(sessionId);
+      const task = this.readTask(sessionId, taskId);
+      // Reviewing one's own work is the failure this role split exists to prevent,
+      // and it is checkable without naming a role: the registry is the authority for
+      // which roles exist, so hardcoding "only `reviewer` may approve" here would be
+      // a second list to keep in step. Who the task belongs to is the real property.
+      if (task.frozen.subject === actor) {
+        throw new LedgerError('REVIEW_SELF',
+          `task ${taskId} is assigned to ${actor}, which cannot review its own work`,
+          { taskId, subject: task.frozen.subject });
+      }
+      const snapshot = task.inputSnapshotDigest;
+      if (draft.inputSnapshotDigest !== undefined && draft.inputSnapshotDigest !== snapshot) {
+        throw new LedgerError('REVIEW_STALE',
+          `the review was made against input snapshot ${draft.inputSnapshotDigest}, but task ${taskId} ` +
+            `is now at ${snapshot}. Re-read the task and review the candidate against current truth.`,
+          { declared: draft.inputSnapshotDigest, current: snapshot, taskId });
+      }
+      // An approval must name the requirement revision it judged against, and that
+      // revision has to be one the task actually declares. Accepting an unchecked
+      // string would give the binding the plan requires the *appearance* of being
+      // enforced, which is worse than not having the field: a later reader would
+      // trust it. Non-approvals may omit it — asking for changes does not stop
+      // being the right answer when the contract moves.
+      const declared = task.frozen.inputs ?? [];
+      if (draft.status === 'approved') {
+        if (draft.requirementsRevision === undefined) {
+          throw new LedgerError('MALFORMED_REVIEW',
+            'an approval must name the requirementsRevision it was judged against (plan §5); ' +
+              `task ${taskId} declares ${declared.map((i) => `${i.id}@${i.revision}`).join(', ') || 'no inputs'}`);
+        }
+        if (!declared.some((input) => input.revision === draft.requirementsRevision)) {
+          throw new LedgerError('REVIEW_REQUIREMENT_UNKNOWN',
+            `requirementsRevision ${draft.requirementsRevision} is not among task ${taskId}'s declared inputs ` +
+              `(${declared.map((i) => `${i.id}@${i.revision}`).join(', ') || 'none'}). An approval anchored to a ` +
+              'revision the task never depended on cannot go stale when the real requirement moves.',
+            { requirementsRevision: draft.requirementsRevision, taskId });
+        }
+      }
+
+      const seq = (session.reviewSeq ?? 0) + 1;
+      const reviewId = `review:${taskId.includes(':') ? taskId.slice(taskId.indexOf(':') + 1) : taskId}-${seq}`;
+      const decision = {
+        sessionId,
+        taskId,
+        reviewer: { subject: actor, role: actorRole },
+        candidateRevision: draft.candidateRevision,
+        inputSnapshotDigest: snapshot,
+        ...(draft.requirementsRevision ? { requirementsRevision: draft.requirementsRevision } : {}),
+        status: draft.status,
+        findings,
+        validationEvidence,
+        summary: draft.summary,
+      };
+      const file = this.reviewFile(sessionId, reviewId);
+      if (fs.existsSync(file)) {
+        throw new LedgerError('REVIEW_EXISTS',
+          `review ${reviewId} already exists at ${file}; session.reviewSeq disagrees with the directory`);
+      }
+      const at = nowIso();
+      const record = {
+        schemaVersion: 1,
+        seq,
+        reviewId,
+        decision,
+        decisionDigest: jsonDigest(decision),
+        recordedAt: at,
+        recordedBy: actor,
+      };
+      fs.mkdirSync(this.reviewsDir(sessionId), { recursive: true });
+      writeJsonAtomic(file, record);
+      session.reviewSeq = seq;
+      this.#commit(session, {
+        kind: 'review-recorded',
+        at,
+        actor,
+        actorRole,
+        reviewId,
+        taskId,
+        status: decision.status,
+        candidateRevision: decision.candidateRevision,
+        inputSnapshotDigest: snapshot,
+        unresolved: unresolved.length,
+        decisionDigest: record.decisionDigest,
+      });
+      return record;
+    });
+  }
+
+  /**
+   * The review state of one task: the latest decision, and whether it still applies.
+   *
+   * Applicability is derived here and never stored. A `stale` field written into the
+   * decision would be a fact that stops being true the moment the candidate moves —
+   * and the whole point of plan §17 Scenario 5 is that nobody goes back to update it.
+   * Deriving it means the answer cannot be out of date, only unknown.
+   *
+   * `candidateRevision` is the caller's to supply: this layer does not run git and
+   * cannot know what the candidate is now. Omitting it does not buy an optimistic
+   * answer — it yields `applies: null`, the same "unknown beats false" the inbox
+   * uses for a task it cannot read. Inputs having moved still returns false, because
+   * that much is known regardless of which candidate is being asked about.
+   */
+  reviewStateFor(sessionId, taskId, { candidateRevision = null } = {}) {
+    assertId(sessionId, 'sessionId');
+    assertId(taskId, 'taskId');
+    if (candidateRevision !== null) assertRevision(candidateRevision, 'candidateRevision');
+    const task = this.readTask(sessionId, taskId);
+    const decisions = this.listReviews(sessionId).filter((r) => r.decision.taskId === taskId);
+    const current = { inputSnapshotDigest: task.inputSnapshotDigest, candidateRevision };
+    const latest = decisions.at(-1);
+    if (!latest) {
+      return {
+        sessionId, taskId, status: 'none', reviewId: null, reviewer: null, recordedAt: null,
+        reviewCount: 0, unresolvedFindings: 0, applies: false, reasons: ['no-review'],
+        observed: null, current,
+      };
+    }
+    const d = latest.decision;
+    const reasons = [];
+    if (d.inputSnapshotDigest !== task.inputSnapshotDigest) reasons.push('inputs-moved');
+    if (candidateRevision !== null && d.candidateRevision !== candidateRevision) reasons.push('candidate-moved');
+    let applies;
+    if (reasons.length) applies = false;
+    else if (candidateRevision === null) { applies = null; reasons.push('candidate-unknown'); }
+    else applies = true;
+    return {
+      sessionId,
+      taskId,
+      status: d.status,
+      reviewId: latest.reviewId,
+      reviewer: d.reviewer,
+      recordedAt: latest.recordedAt,
+      reviewCount: decisions.length,
+      unresolvedFindings: d.findings.filter((f) => FINDING_UNRESOLVED.has(f.status)).length,
+      applies,
+      reasons,
+      observed: {
+        candidateRevision: d.candidateRevision,
+        inputSnapshotDigest: d.inputSnapshotDigest,
+        requirementsRevision: d.requirementsRevision ?? null,
+      },
+      current,
+    };
+  }
 }
+

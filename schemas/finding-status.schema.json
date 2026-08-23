@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/crazycola23/team-layer/schemas/finding-status.schema.json",
+  "title": "Finding status",
+  "description": "Where the finding stands. `rejected-with-evidence` and `accepted-risk` are resolutions, not dismissals: both require the reason to be written down, which is what makes them different from deleting the finding.",
+  "x-generated-from": "src/ledger.mjs FINDING_STATUSES",
+  "type": "string",
+  "enum": [
+    "open",
+    "fixed",
+    "verified",
+    "closed",
+    "rejected-with-evidence",
+    "accepted-risk",
+    "unresolved-product"
+  ]
+}

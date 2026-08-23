@@ -14,7 +14,8 @@
     "createdAt",
     "updatedAt",
     "eventSeq",
-    "handoffSeq"
+    "handoffSeq",
+    "reviewSeq"
   ],
   "properties": {
     "schemaVersion": {
@@ -48,6 +49,11 @@
     },
     "handoffSeq": {
       "description": "Count of handoffs published in this session. Kept on the session rather than derived from the handoffs directory so that a lost file cannot cause the next handoff to reuse an id that events.jsonl already records.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "reviewSeq": {
+      "description": "Count of review decisions recorded in this session. Kept on the session for the same reason handoffSeq is: a lost file must not let the next decision reuse an id that events.jsonl already records, because the reused id would resolve to the wrong judgement.",
       "type": "integer",
       "minimum": 0
     },

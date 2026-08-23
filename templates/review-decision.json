@@ -1,0 +1,26 @@
+{
+  "$comment": "A review draft: what you write, before `teamctl review record --review <this>` turns it into a decision. The ledger fills in reviewId, seq, reviewer, inputSnapshotDigest, recordedAt, recordedBy and decisionDigest; setting any of them here is refused rather than overridden. inputSnapshotDigest in particular is copied from the task, so a decision cannot claim to have been made against a snapshot it was not. Approving requires requirementsRevision, and it must name one of the task's declared inputs: an approval anchored to a revision the task never depended on could never go stale when the real requirement moved. The findings below include an open `minor`; only an unresolved `blocker` refuses an approval, because forcing the reviewer to choose between blocking and downgrading produces blockers relabelled as minors. See schemas/review-decision.schema.json for the stored shape and protocol/review.md for how a decision is consumed.",
+  "sessionId": "feature:example",
+  "taskId": "task:example",
+  "status": "approved",
+  "candidateRevision": "git:def5678",
+  "requirementsRevision": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "summary": "AC-1 holds: the discount is applied in the domain layer, so the batch import path goes through the same rule rather than a second copy of it. Stacking is rejected with 409 as the contract requires.",
+  "findings": [
+    {
+      "schemaVersion": 1,
+      "findingId": "FIND-001",
+      "severity": "minor",
+      "status": "open",
+      "candidateRevision": "git:def5678",
+      "requirement": "AC-1",
+      "location": "src/coupon/apply.ts:88",
+      "evidence": "The idempotency key is rebuilt from the order id alone, so two coupons on one order collide in the log even though the rule itself is correct.",
+      "impact": "Support cannot tell which coupon was rejected from the log line; the behaviour is right, the record of it is ambiguous.",
+      "requiredOutcome": "The key includes the coupon id, or the log line names it separately."
+    }
+  ],
+  "validationEvidence": [
+    "npm test"
+  ]
+}

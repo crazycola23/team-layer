@@ -15,6 +15,7 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const SESSION_SCHEMA = loadSchema(path.join(ROOT, 'schemas', 'session.schema.json'));
 const TASK_SCHEMA = loadSchema(path.join(ROOT, 'schemas', 'task-record.schema.json'));
 const HANDOFF_SCHEMA = loadSchema(path.join(ROOT, 'schemas', 'handoff.schema.json'));
+const REVIEW_SCHEMA = loadSchema(path.join(ROOT, 'schemas', 'review-decision.schema.json'));
 
 function tempCommonDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'team-layer-ledger-'));
@@ -729,4 +730,316 @@ test('only the addressee can acknowledge, so nobody else can empty their queue',
   assert.deepEqual(ledger.readEvents(sessionId)
     .filter((e) => e.kind === 'handoff-acked').map((e) => [e.actor, e.actorRole]),
   [['agent:reviewer-07', 'reviewer'], ['agent:reviewer-99', 'reviewer']]);
+});
+
+// ----------------------------------------------------------------------- reviews
+
+const REQUIREMENT = `sha256:${'1'.repeat(64)}`;
+
+function decision(overrides = {}) {
+  return {
+    taskId: 'task:coupon',
+    status: 'approved',
+    candidateRevision: 'git:def5678',
+    requirementsRevision: REQUIREMENT,
+    summary: 'AC-1 holds: the discount is applied in the domain layer, so the import path shares the rule.',
+    ...overrides,
+  };
+}
+
+function finding(overrides = {}) {
+  return {
+    schemaVersion: 1,
+    findingId: 'FIND-001',
+    severity: 'blocker',
+    status: 'open',
+    candidateRevision: 'git:def5678',
+    requirement: 'AC-1',
+    location: 'src/coupon/apply.ts:12',
+    evidence: 'Two coupons on one order both apply.',
+    impact: 'The order total can go negative.',
+    requiredOutcome: 'At most one coupon applies per order.',
+    ...overrides,
+  };
+}
+
+/** Record a decision as a reviewer who is not the task subject. */
+function review(ledger, sessionId, draft, over = {}) {
+  return ledger.recordReview({ sessionId, draft, actorRole: 'reviewer', ...over });
+}
+
+test('a recorded review is schema-valid and the ledger owns its identity', () => {
+  const { ledger, sessionId } = taskedSession();
+  const record = review(ledger, sessionId, decision());
+
+  assert.deepEqual(validate(REVIEW_SCHEMA, record), []);
+  // `review:<task-name>-<seq>`, not `review:coupon:3`: an id carries at most one
+  // `:`, so the scheme has to be the only colon in it.
+  assert.equal(record.reviewId, 'review:coupon-1');
+  assert.equal(record.seq, 1);
+  assert.deepEqual(record.decision.reviewer, { subject: 'test', role: 'reviewer' });
+
+  // The snapshot is copied from the task, not accepted from the reviewer, so a
+  // decision cannot claim to have been made against truth that never held.
+  const task = ledger.readTask(sessionId, 'task:coupon');
+  assert.equal(record.decision.inputSnapshotDigest, task.inputSnapshotDigest);
+
+  const event = ledger.readEvents(sessionId).find((e) => e.kind === 'review-recorded');
+  assert.equal(event.reviewId, record.reviewId);
+  assert.equal(event.at, record.recordedAt);
+  assert.equal(event.decisionDigest, record.decisionDigest);
+  assert.deepEqual(ledger.listReviews(sessionId).map((r) => r.reviewId), [record.reviewId]);
+});
+
+/**
+ * "Reviewer approval is semantic evidence, and does not bypass the CI/tests/spec-suite
+ * gate" (plan §5, last line), made mechanical.
+ *
+ * This is an absence test, and absences are what rot: the natural next edit is to
+ * have `recordReview` advance the task to `approved` for the caller's convenience,
+ * and the day it does, the reviewer's opinion becomes sufficient on its own. The
+ * merge gate still owes its structural checks, so nothing here may move on its say.
+ */
+test('recording a decision moves neither the task nor the session', () => {
+  const { ledger, sessionId } = taskedSession();
+  const before = { task: ledger.readTask(sessionId, 'task:coupon'), session: ledger.readSession(sessionId) };
+
+  review(ledger, sessionId, decision());
+
+  const task = ledger.readTask(sessionId, 'task:coupon');
+  assert.equal(task.state.status, before.task.state.status);
+  assert.equal(task.state.generation, before.task.state.generation);
+  assert.equal(task.frozenDigest, before.task.frozenDigest);
+  assert.equal(ledger.readSession(sessionId).status, before.session.status);
+
+  // Only the record itself was added to the log: no status transition slipped in
+  // alongside it under a different event kind.
+  assert.deepEqual(ledger.readEvents(sessionId).slice(before.session.eventSeq).map((e) => e.kind),
+    ['review-recorded']);
+});
+
+/**
+ * An approval binds candidate, input snapshot and requirement revision (plan §5).
+ *
+ * The requirement half is the one worth enforcing rather than merely storing. An
+ * approval anchored to a revision the task never depended on cannot go stale when
+ * the real requirement moves — so accepting an unchecked string would give the
+ * binding the appearance of being enforced, which is worse than not having the
+ * field, because a later reader would trust it.
+ */
+test('an approval must name a requirement revision the task actually depends on', () => {
+  const { ledger, sessionId } = taskedSession();
+  const record = (over) => code(() => review(ledger, sessionId, decision(over)));
+
+  assert.equal(record({ requirementsRevision: undefined }), 'MALFORMED_REVIEW');
+  assert.equal(record({ requirementsRevision: `sha256:${'9'.repeat(64)}` }), 'REVIEW_REQUIREMENT_UNKNOWN');
+  assert.equal(record({ requirementsRevision: 'not-a-revision' }), 'MALFORMED_REVISION');
+
+  // A non-approval may omit it: asking for changes does not stop being the right
+  // answer when the contract moves underneath it.
+  assert.equal(record({
+    status: 'changes-requested', requirementsRevision: undefined, findings: [finding()],
+  }), null);
+  assert.equal(record({}), null);
+});
+
+/**
+ * A decision that contradicts its own findings is internally inconsistent frozen
+ * truth: every later reader has to guess which half to believe.
+ */
+test('a decision may not contradict its own findings', () => {
+  const { ledger, sessionId } = taskedSession();
+  const record = (over) => code(() => review(ledger, sessionId, decision(over)));
+
+  assert.equal(record({ findings: [finding()] }), 'REVIEW_INCONSISTENT');
+  assert.equal(record({ status: 'changes-requested', findings: [] }), 'REVIEW_INCONSISTENT');
+  assert.equal(record({ status: 'changes-requested', findings: [finding({ status: 'verified' })] }),
+    'REVIEW_INCONSISTENT');
+  assert.equal(record({ status: 'blocked-unresolved', findings: [finding()] }), 'REVIEW_INCONSISTENT');
+  assert.equal(record({ status: 'blocked-unresolved', findings: [finding({ status: 'unresolved-product' })] }),
+    null);
+
+  // Only `blocker` blocks. Refusing on an unresolved `major` would not produce
+  // better reviews; it would produce majors relabelled as minors, which destroys
+  // the signal rather than the ambiguity.
+  assert.equal(record({ findings: [finding({ severity: 'major' })] }), null);
+
+  // `fixed` is the implementer's claim, so it is not outstanding: a reviewer looking
+  // at a fixed finding either verifies it or does not, and both answers move it out
+  // of the set. Counting it would block approvals that have done the work already.
+  assert.equal(record({ findings: [finding({ status: 'fixed' })] }), null);
+  assert.equal(record({ status: 'changes-requested', findings: [finding({ status: 'fixed' })] }),
+    'REVIEW_INCONSISTENT');
+});
+
+/**
+ * Nobody reviews their own work — checked on task ownership, not on role name.
+ *
+ * A check that read "only the `reviewer` role may approve" would be a second copy of
+ * the role list to keep in step with the registry, and it would still permit the one
+ * case that matters: an agent holding the reviewer role approving a task assigned to
+ * itself. Ownership is the property that actually carries the independence.
+ */
+test('a task subject cannot review its own work, whatever role it claims', () => {
+  const { ledger, sessionId } = taskedSession();
+  assert.equal(code(() => review(ledger, sessionId, decision(), { actor: 'agent:fullstack-01' })),
+    'REVIEW_SELF');
+  assert.equal(code(() => review(ledger, sessionId, decision(),
+    { actor: 'agent:fullstack-01', actorRole: 'reviewer' })), 'REVIEW_SELF');
+  assert.equal(ledger.listReviews(sessionId).length, 0);
+});
+
+test('a review draft cannot assign what the ledger owns, or misspell what it does own', () => {
+  const { ledger, sessionId } = taskedSession();
+  const record = (over) => code(() => review(ledger, sessionId, decision(over)));
+
+  for (const owned of ['reviewId', 'seq', 'reviewer', 'recordedAt', 'recordedBy', 'decisionDigest']) {
+    assert.equal(record({ [owned]: 'anything' }), 'MALFORMED_REVIEW', `${owned} is the ledger's to assign`);
+  }
+  // A misspelled field is refused rather than ignored, because ignoring it records
+  // a decision whose content is silently missing — and the digest would certify it.
+  assert.equal(record({ finding: [finding()] }), 'MALFORMED_REVIEW');
+  assert.equal(record({ summary: '   ' }), 'MALFORMED_REVIEW');
+  assert.equal(record({ validationEvidence: ['npm test', ''] }), 'MALFORMED_REVIEW');
+  assert.equal(record({ findings: [finding({ severity: 'critical' })] }), 'MALFORMED_REVIEW');
+  assert.equal(record({ findings: [finding({ status: 'wontfix' })] }), 'MALFORMED_REVIEW');
+  assert.equal(record({ status: 'lgtm' }), 'UNKNOWN_REVIEW_STATUS');
+  assert.equal(code(() => review(ledger, sessionId, decision(), { actorRole: 'architect' })), 'UNKNOWN_ROLE');
+  assert.equal(record({ sessionId: 'feature:other' }), 'SESSION_MISMATCH');
+  assert.equal(record({ taskId: 'task:absent' }), 'NOT_FOUND');
+  assert.equal(ledger.listReviews(sessionId).length, 0);
+});
+
+/**
+ * The digest identifies the judgement, not the act of recording it.
+ *
+ * Two identical decisions must hash identically so that "you already approved this"
+ * is detectable; that is why `seq`, `recordedAt` and the id that embeds `seq` sit
+ * outside the digested half.
+ */
+test('identical judgements hash identically and remain separately addressable', () => {
+  const { ledger, sessionId } = taskedSession();
+  const first = review(ledger, sessionId, decision());
+  const again = review(ledger, sessionId, decision());
+
+  assert.equal(again.decisionDigest, first.decisionDigest);
+  assert.notEqual(again.reviewId, first.reviewId);
+  assert.deepEqual(ledger.listReviews(sessionId).map((r) => r.seq), [1, 2]);
+
+  const moved = review(ledger, sessionId, decision({ candidateRevision: 'git:ba55e77' }));
+  assert.notEqual(moved.decisionDigest, first.decisionDigest);
+});
+
+/**
+ * An approval anyone can edit is an approval anyone can manufacture.
+ *
+ * Unlike a handoff, an approval is consulted by something downstream deciding
+ * whether work may proceed, so it has to be tamper-evident on every read rather
+ * than at some later audit — by then the merge has already happened.
+ */
+test('an edited decision is refused on read rather than silently believed', () => {
+  const { ledger, sessionId } = taskedSession();
+  const record = review(ledger, sessionId, decision({ status: 'changes-requested', findings: [finding()] }));
+  const file = ledger.reviewFile(sessionId, record.reviewId);
+
+  const stored = JSON.parse(fs.readFileSync(file, 'utf8'));
+  stored.decision.status = 'approved';
+  stored.decision.findings = [];
+  fs.writeFileSync(file, `${JSON.stringify(stored, null, 2)}\n`);
+
+  assert.equal(code(() => ledger.readReview(sessionId, record.reviewId)), 'REVIEW_TAMPERED');
+  // And it does not become believable by being read through the listing instead.
+  assert.equal(code(() => ledger.listReviews(sessionId)), 'REVIEW_TAMPERED');
+  assert.equal(code(() => ledger.reviewStateFor(sessionId, 'task:coupon')), 'REVIEW_TAMPERED');
+});
+
+/**
+ * Plan §17 Scenario 5: reviewer approved `git:AAA`, fullstack then created `git:BBB`,
+ * so the old approval must be stale.
+ *
+ * It is derived on read, never stored. A `stale: false` written at approval time is
+ * a fact with an expiry date — the commit that invalidates it has no way to reach
+ * back into the JSON file — so the only honest place to compute it is here, where
+ * both halves of the comparison are current.
+ */
+test('an approval stops applying when the candidate or the inputs move', () => {
+  const { ledger, sessionId } = taskedSession();
+  const state = (over) => ledger.reviewStateFor(sessionId, 'task:coupon', over);
+
+  const none = state({ candidateRevision: 'git:aaaaaaa' });
+  assert.deepEqual([none.status, none.applies, none.reasons, none.observed],
+    ['none', false, ['no-review'], null]);
+
+  review(ledger, sessionId, decision({ candidateRevision: 'git:aaaaaaa' }));
+  const fresh = state({ candidateRevision: 'git:aaaaaaa' });
+  assert.deepEqual([fresh.status, fresh.applies, fresh.reasons], ['approved', true, []]);
+  assert.equal(fresh.reviewId, 'review:coupon-1');
+  assert.equal(fresh.reviewCount, 1);
+
+  const moved = state({ candidateRevision: 'git:bbbbbbb' });
+  assert.deepEqual([moved.applies, moved.reasons], [false, ['candidate-moved']]);
+  assert.equal(moved.observed.candidateRevision, 'git:aaaaaaa', 'it says which candidate was approved');
+  assert.equal(moved.current.candidateRevision, 'git:bbbbbbb', 'and which one was asked about');
+
+  // No candidate supplied is unknown, not approved: this layer does not run git, and
+  // answering "yes" about a candidate nobody named is the failure mode to avoid.
+  const unknown = state();
+  assert.deepEqual([unknown.applies, unknown.reasons], [null, ['candidate-unknown']]);
+
+  // Inputs moving is known regardless of which candidate is being asked about, so it
+  // is false rather than null even with no candidate.
+  ledger.reissueTask({
+    sessionId, reason: 'coupon contract v2',
+    packet: packet({ inputs: [{ id: 'contract:coupon', revision: `sha256:${'9'.repeat(64)}`, authority: 'product-architect' }] }),
+  });
+  assert.deepEqual(state().reasons, ['inputs-moved']);
+  assert.equal(state().applies, false);
+  assert.deepEqual(state({ candidateRevision: 'git:aaaaaaa' }).reasons, ['inputs-moved']);
+  assert.deepEqual(state({ candidateRevision: 'git:bbbbbbb' }).reasons, ['inputs-moved', 'candidate-moved']);
+
+  // The latest decision is the one that answers, and it can restore applicability.
+  review(ledger, sessionId, decision({
+    candidateRevision: 'git:bbbbbbb', requirementsRevision: `sha256:${'9'.repeat(64)}`,
+  }));
+  const again = state({ candidateRevision: 'git:bbbbbbb' });
+  assert.deepEqual([again.applies, again.reasons, again.reviewCount], [true, [], 2]);
+  assert.equal(again.observed.requirementsRevision, `sha256:${'9'.repeat(64)}`);
+});
+
+/**
+ * The same staleness, refused at record time when the reviewer declares the snapshot.
+ *
+ * Declaring it is optional, because the ledger copies the current snapshot anyway.
+ * What the declaration buys is the refusal: a reviewer who read the task, went away
+ * to review, and came back after a reissue would otherwise have their judgement
+ * silently relabelled as being about inputs they never saw.
+ */
+test('a review declaring a snapshot the task has moved past is refused', () => {
+  const { ledger, sessionId } = taskedSession();
+  const stale = ledger.readTask(sessionId, 'task:coupon').inputSnapshotDigest;
+  assert.equal(code(() => review(ledger, sessionId, decision({ inputSnapshotDigest: stale }))), null);
+
+  ledger.reissueTask({
+    sessionId, reason: 'coupon contract v2',
+    packet: packet({ inputs: [{ id: 'contract:coupon', revision: `sha256:${'9'.repeat(64)}`, authority: 'product-architect' }] }),
+  });
+  assert.equal(code(() => review(ledger, sessionId, decision({
+    inputSnapshotDigest: stale, requirementsRevision: `sha256:${'9'.repeat(64)}`,
+  }))), 'REVIEW_STALE');
+  assert.equal(ledger.listReviews(sessionId).length, 1);
+});
+
+test('the shipped review template records against the shipped task packet', () => {
+  const template = JSON.parse(fs.readFileSync(path.join(ROOT, 'templates', 'review-decision.json'), 'utf8'));
+  const shipped = JSON.parse(fs.readFileSync(path.join(ROOT, 'templates', 'task-packet.json'), 'utf8'));
+  const { ledger, sessionId } = startedSession({ sessionId: shipped.sessionId });
+  ledger.issueTask({ sessionId, packet: shipped });
+
+  // Only the ids are filled in. The requirement the template approves against is
+  // one the shipped packet declares, so the two templates can be followed end to
+  // end — a review template naming a revision no shipped task depends on would
+  // teach the reader a shape that is refused the first time they try it.
+  const record = review(ledger, sessionId, { ...template, sessionId, taskId: shipped.taskId });
+  assert.deepEqual(validate(REVIEW_SCHEMA, record), []);
+  assert.equal(record.decision.status, 'approved');
 });

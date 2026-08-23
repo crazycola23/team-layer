@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/crazycola23/team-layer/schemas/review-status.schema.json",
+  "title": "Review decision status",
+  "description": "What a review concluded (plan §5). Deliberately three answers and not a score: the merge gate has to branch on this, and \"7/10\" is not a branch. `blocked-unresolved` is separate from `changes-requested` because it routes to whoever owns the requirement rather than back to the implementer.",
+  "x-generated-from": "src/ledger.mjs REVIEW_STATUSES",
+  "type": "string",
+  "enum": [
+    "approved",
+    "changes-requested",
+    "blocked-unresolved"
+  ]
+}

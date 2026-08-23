@@ -13,7 +13,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { inputSnapshotDigest, DigestError, REVISION_PATTERN, DIGEST_PATTERN, GIT_REVISION_PATTERN } from '../src/digest.mjs';
-import { SESSION_STATUSES, TASK_STATUSES, HANDOFF_ACTIONS } from '../src/ledger.mjs';
+import { SESSION_STATUSES, TASK_STATUSES, HANDOFF_ACTIONS, REVIEW_STATUSES, FINDING_SEVERITIES, FINDING_STATUSES } from '../src/ledger.mjs';
 import { ID_PATTERN, MAX_ID_LENGTH } from '../src/slug.mjs';
 import { SKILL_ROOT, roleIds, registryDigest } from '../src/roles.mjs';
 
@@ -127,6 +127,40 @@ emit('schemas/handoff-action.schema.json', {
   'x-generated-from': 'src/ledger.mjs HANDOFF_ACTIONS',
   type: 'string',
   enum: HANDOFF_ACTIONS,
+});
+
+emit('schemas/review-status.schema.json', {
+  $schema: 'https://json-schema.org/draft/2020-12/schema',
+  $id: 'https://github.com/crazycola23/team-layer/schemas/review-status.schema.json',
+  title: 'Review decision status',
+  description: 'What a review concluded (plan §5). Deliberately three answers and not a score: the merge gate has to branch on this, and "7/10" is not a branch. `blocked-unresolved` is separate from `changes-requested` because it routes to whoever owns the requirement rather than back to the implementer.',
+  'x-generated-from': 'src/ledger.mjs REVIEW_STATUSES',
+  type: 'string',
+  enum: REVIEW_STATUSES,
+});
+
+// Findings are embedded in review decisions, and `recordReview` checks a decision
+// against its own findings. Generating the vocabulary keeps that check honest: a
+// severity the schema allows but the ledger has never heard of would slip past
+// every consistency rule it has.
+emit('schemas/finding-severity.schema.json', {
+  $schema: 'https://json-schema.org/draft/2020-12/schema',
+  $id: 'https://github.com/crazycola23/team-layer/schemas/finding-severity.schema.json',
+  title: 'Finding severity',
+  description: 'How much the finding matters. Only `blocker` prevents approval; see FINDING_UNRESOLVED in src/ledger.mjs for why the others do not.',
+  'x-generated-from': 'src/ledger.mjs FINDING_SEVERITIES',
+  type: 'string',
+  enum: FINDING_SEVERITIES,
+});
+
+emit('schemas/finding-status.schema.json', {
+  $schema: 'https://json-schema.org/draft/2020-12/schema',
+  $id: 'https://github.com/crazycola23/team-layer/schemas/finding-status.schema.json',
+  title: 'Finding status',
+  description: 'Where the finding stands. `rejected-with-evidence` and `accepted-risk` are resolutions, not dismissals: both require the reason to be written down, which is what makes them different from deleting the finding.',
+  'x-generated-from': 'src/ledger.mjs FINDING_STATUSES',
+  type: 'string',
+  enum: FINDING_STATUSES,
 });
 
 // -------------------------------------------------- input snapshot test vectors

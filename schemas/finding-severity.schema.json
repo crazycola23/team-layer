@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/crazycola23/team-layer/schemas/finding-severity.schema.json",
+  "title": "Finding severity",
+  "description": "How much the finding matters. Only `blocker` prevents approval; see FINDING_UNRESOLVED in src/ledger.mjs for why the others do not.",
+  "x-generated-from": "src/ledger.mjs FINDING_SEVERITIES",
+  "type": "string",
+  "enum": [
+    "blocker",
+    "major",
+    "minor",
+    "note"
+  ]
+}
