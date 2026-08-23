@@ -2,16 +2,56 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/crazycola23/team-layer/schemas/session.schema.json",
   "title": "Team Session",
+  "description": "Shared mutable session state, stored at <git-common-dir>/team-layer/sessions/<slug>/session.json. `revision` is the compare-and-swap guard: a writer passes the revision it read and its write is refused if anything moved underneath it. `eventSeq` is authoritative for how many events events.jsonl must hold, so a truncated log is detectable rather than silently short.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schemaVersion", "sessionId", "status", "integrationTarget", "createdAt"],
+  "required": [
+    "schemaVersion",
+    "sessionId",
+    "revision",
+    "status",
+    "integrationTarget",
+    "createdAt",
+    "updatedAt",
+    "eventSeq"
+  ],
   "properties": {
-    "schemaVersion": {"const": 1},
-    "sessionId": {"type": "string", "minLength": 1},
-    "status": {"enum": ["forming", "product-definition", "implementation", "review", "integration", "completed", "blocked", "cancelled"]},
-    "integrationTarget": {"type": "string", "minLength": 1},
-    "createdAt": {"$ref": "timestamp.schema.json"},
-    "canonicalProvider": {"type": "string"},
-    "notes": {"type": "string"}
+    "schemaVersion": {
+      "const": 1
+    },
+    "sessionId": {
+      "$ref": "id.schema.json"
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "status": {
+      "$ref": "session-status.schema.json"
+    },
+    "integrationTarget": {
+      "description": "The branch this session integrates into. Recorded on the session rather than per task, because two tasks in one session merging to different targets is a split session, not a shared one.",
+      "type": "string",
+      "minLength": 1
+    },
+    "createdAt": {
+      "$ref": "timestamp.schema.json"
+    },
+    "updatedAt": {
+      "$ref": "timestamp.schema.json"
+    },
+    "eventSeq": {
+      "description": "Count of events appended to events.jsonl. Written before the event itself, so a crash between the two reads as a truncated log instead of an event nothing accounts for.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "canonicalProvider": {
+      "description": "Which layer resolves canonical input revisions for this session, e.g. \"spec-suite\". Absent means compatibility mode: revisions are recorded as declared and cannot be re-resolved.",
+      "type": "string",
+      "minLength": 1
+    },
+    "notes": {
+      "type": "string"
+    }
   }
 }

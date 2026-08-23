@@ -5,31 +5,97 @@
   "description": "The frozen truth of one assigned task: what an Agent is allowed to rely on. Nothing here may change without restating the task.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schemaVersion", "taskId", "subject", "role", "baseRevision", "readSet", "writeSet", "inputs", "acceptance", "validation"],
+  "required": [
+    "schemaVersion",
+    "taskId",
+    "sessionId",
+    "subject",
+    "role",
+    "baseRevision",
+    "readSet",
+    "writeSet",
+    "inputs",
+    "acceptance",
+    "validation"
+  ],
   "properties": {
-    "schemaVersion": {"const": 1},
-    "taskId": {"type": "string", "minLength": 1},
-    "sessionId": {"type": "string", "minLength": 1},
-    "subject": {"type": "string", "pattern": "^agent:.+"},
-    "role": {"$ref": "role.schema.json"},
-    "baseRevision": {"$ref": "git-revision.schema.json"},
-    "readSet": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
-    "writeSet": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+    "schemaVersion": {
+      "const": 1
+    },
+    "taskId": {
+      "$ref": "id.schema.json"
+    },
+    "sessionId": {
+      "$ref": "id.schema.json"
+    },
+    "subject": {
+      "type": "string",
+      "pattern": "^agent:.+"
+    },
+    "role": {
+      "$ref": "role.schema.json"
+    },
+    "baseRevision": {
+      "$ref": "git-revision.schema.json"
+    },
+    "readSet": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "writeSet": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
     "inputs": {
       "description": "Declared semantic dependencies. Only id+revision are hashed into inputSnapshotDigest; authority records who can resolve the revision and is deliberately excluded from the digest.",
       "type": "array",
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "revision", "authority"],
+        "required": [
+          "id",
+          "revision",
+          "authority"
+        ],
         "properties": {
-          "id": {"type": "string", "minLength": 1},
-          "revision": {"$ref": "revision.schema.json"},
-          "authority": {"type": "string", "minLength": 1}
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "revision": {
+            "$ref": "revision.schema.json"
+          },
+          "authority": {
+            "type": "string",
+            "minLength": 1
+          }
         }
       }
     },
-    "acceptance": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
-    "validation": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true}
+    "acceptance": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "validation": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    }
   }
 }

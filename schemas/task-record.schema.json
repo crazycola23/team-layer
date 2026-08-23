@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/crazycola23/team-layer/schemas/task-record.schema.json",
+  "title": "Task Record",
+  "description": "One task as the ledger stores it. The two halves are deliberately separated: `frozen` is the agreed truth and is content-addressed by `frozenDigest`, `state` is everything that may move while that truth stays fixed. Restating a task replaces `frozen` wholesale and bumps `state.generation`; it never edits `frozen` in place.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "revision", "frozen", "frozenDigest", "inputSnapshotDigest", "state"],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "revision": {"type": "integer", "minimum": 1},
+    "frozen": {"$ref": "task-packet.schema.json"},
+    "frozenDigest": {"$ref": "digest.schema.json"},
+    "inputSnapshotDigest": {"$ref": "digest.schema.json"},
+    "state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "generation", "issuedAt", "updatedAt"],
+      "properties": {
+        "status": {"$ref": "task-status.schema.json"},
+        "generation": {"type": "integer", "minimum": 1},
+        "issuedAt": {"$ref": "timestamp.schema.json"},
+        "updatedAt": {"$ref": "timestamp.schema.json"},
+        "note": {"type": "string"}
+      }
+    }
+  }
+}

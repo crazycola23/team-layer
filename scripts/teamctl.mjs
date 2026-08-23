@@ -6,6 +6,9 @@ import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
 import { roleIds, isRole, roleFile, roleVersion } from '../src/roles.mjs';
+import { Ledger, LedgerError, SESSION_STATUSES, TASK_STATUSES } from '../src/ledger.mjs';
+import { SlugError } from '../src/slug.mjs';
+import { DigestError } from '../src/digest.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const SCRIPT_DIR = path.dirname(__filename);
@@ -375,12 +378,228 @@ function show(args) {
   console.log(JSON.stringify({ identity, binding }, null, 2));
 }
 
+// --------------------------------------------------------------------- ledger
+// Everything below drives src/ledger.mjs. The ledger lives in the Git common
+// dir, which linked worktrees share, so these commands are how three Agent
+// windows on one machine see one session without any server.
+
+/**
+ * Who to record as the actor.
+ *
+ * The bound agent id is preferred over anything passed on the command line: an
+ * audit log where the actor is whatever the caller felt like typing is not
+ * evidence of anything.
+ */
+function actorFor(repo, args) {
+  const bindingPath = path.join(repo.root, '.agent-team-binding.json');
+  if (fs.existsSync(bindingPath)) {
+    const binding = readJson(bindingPath);
+    if (binding.agentId) return `agent:${binding.agentId}`;
+  }
+  if (typeof args.actor === 'string') return args.actor;
+  die('no agent binding found in this worktree; run `teamctl setup` first, or pass --actor for a one-off');
+}
+
+function ledgerFor(args) {
+  const repo = repoInfo(args.repo || '.');
+  const ledger = new Ledger({
+    commonDir: repo.commonDir,
+    actor: actorFor(repo, args),
+    ...(args['lock-timeout'] ? { lockTimeoutMs: Number(args['lock-timeout']) } : {}),
+  });
+  return { repo, ledger };
+}
+
+function requireFlag(args, name) {
+  const value = args[name];
+  if (typeof value !== 'string' || value === '') die(`--${name} is required`);
+  return value;
+}
+
+function optionalRevision(args, name = 'expect-revision') {
+  if (args[name] === undefined) return null;
+  const value = Number(args[name]);
+  if (!Number.isInteger(value)) die(`--${name} must be an integer`);
+  return value;
+}
+
+function emit(value) {
+  console.log(JSON.stringify(value, null, 2));
+}
+
+/**
+ * Run a ledger command, translating a refusal into an exit code.
+ *
+ * Retryable refusals get their own code because the caller's correct response is
+ * different: re-read and try again, rather than fix the input. A wrapper script
+ * that cannot tell "someone else got there first" from "your packet is wrong"
+ * will eventually paper over one of them.
+ */
+const RETRYABLE = new Set(['REVISION_CONFLICT', 'LOCK_HELD']);
+
+function runLedger(fn) {
+  try {
+    fn();
+  } catch (error) {
+    const code = error?.code;
+    if (!code || !(error instanceof LedgerError || error instanceof SlugError || error instanceof DigestError)) throw error;
+    console.error(JSON.stringify({ status: 'refused', code, message: error.message, ...(error.details ? { details: error.details } : {}) }, null, 2));
+    process.exit(RETRYABLE.has(code) ? 4 : 3);
+  }
+}
+
+function sessionCommand(args) {
+  const sub = args._[1];
+  const { ledger } = ledgerFor(args);
+  runLedger(() => {
+    if (sub === 'start') {
+      emit(ledger.createSession({
+        sessionId: requireFlag(args, 'session'),
+        integrationTarget: requireFlag(args, 'target'),
+        canonicalProvider: typeof args.provider === 'string' ? args.provider : null,
+        notes: typeof args.note === 'string' ? args.note : null,
+      }));
+    } else if (sub === 'list') {
+      emit(ledger.listSessions().map((sessionId) => {
+        const session = ledger.readSession(sessionId);
+        return { sessionId, status: session.status, integrationTarget: session.integrationTarget, updatedAt: session.updatedAt };
+      }));
+    } else if (sub === 'show') {
+      const sessionId = requireFlag(args, 'session');
+      const session = ledger.readSession(sessionId);
+      emit({
+        session,
+        tasks: ledger.listTasks(sessionId).map((taskId) => {
+          const record = ledger.readTask(sessionId, taskId);
+          return { taskId, status: record.state.status, generation: record.state.generation, inputSnapshotDigest: record.inputSnapshotDigest };
+        }),
+        // expectSeq is passed on purpose: showing a session is the cheapest
+        // place to notice that the audit log has been truncated.
+        events: ledger.readEvents(sessionId, { expectSeq: session.eventSeq }).length,
+      });
+    } else if (sub === 'set-status') {
+      emit(ledger.setSessionStatus(requireFlag(args, 'session'), requireFlag(args, 'status'), {
+        expectedRevision: optionalRevision(args),
+        note: typeof args.note === 'string' ? args.note : null,
+      }));
+    } else if (sub === 'events') {
+      const sessionId = requireFlag(args, 'session');
+      const session = ledger.readSession(sessionId);
+      const events = ledger.readEvents(sessionId, { expectSeq: session.eventSeq });
+      emit(typeof args.kind === 'string' ? events.filter((event) => event.kind === args.kind) : events);
+    } else {
+      die('usage: teamctl session <start|list|show|set-status|events>');
+    }
+  });
+}
+
+function taskCommand(args) {
+  const sub = args._[1];
+  const { ledger } = ledgerFor(args);
+  runLedger(() => {
+    if (sub === 'issue' || sub === 'reissue') {
+      const packet = readJson(path.resolve(requireFlag(args, 'packet')));
+      const sessionId = typeof args.session === 'string' ? args.session : packet.sessionId;
+      if (!sessionId) die('--session is required when the packet does not name one');
+      if (sub === 'issue') {
+        emit(ledger.issueTask({ sessionId, packet, expectedRevision: optionalRevision(args) }));
+        return;
+      }
+      const record = ledger.reissueTask({
+        sessionId,
+        packet,
+        reason: requireFlag(args, 'reason'),
+        expectedGeneration: args['expect-generation'] === undefined ? null : Number(args['expect-generation']),
+      });
+      // Surface `unchanged` from the audit event rather than the record, because
+      // it is a property of the transition and not of the task: whether anything
+      // moved is only knowable by comparing against the superseded digest, which
+      // the record no longer carries. It is also the answer the caller acts on —
+      // a restatement that changed nothing must not trigger re-notifying an Agent
+      // or discarding work in progress.
+      //
+      // Searched from the end because a no-op restatement leaves the generation
+      // where it was, so repeated freshness checks all carry the same one and
+      // only their position distinguishes them. The lock is already released by
+      // now, so the last matching event is the closest thing to "ours" available.
+      const event = ledger.readEvents(sessionId).findLast((e) => e.kind === 'task-reissued'
+        && e.taskId === record.frozen.taskId && e.generation === record.state.generation);
+      emit({
+        unchanged: event?.unchanged ?? null,
+        supersededDigest: event?.supersededDigest ?? null,
+        record,
+      });
+    } else if (sub === 'show') {
+      emit(ledger.readTask(requireFlag(args, 'session'), requireFlag(args, 'task')));
+    } else if (sub === 'set-status') {
+      emit(ledger.setTaskStatus(requireFlag(args, 'session'), requireFlag(args, 'task'), requireFlag(args, 'status'), {
+        expectedRevision: optionalRevision(args),
+        note: typeof args.note === 'string' ? args.note : null,
+      }));
+    } else {
+      die('usage: teamctl task <issue|reissue|show|set-status>');
+    }
+  });
+}
+
+/**
+ * "Where am I?" — the answer after a context loss.
+ *
+ * Deliberately one command with no arguments: an Agent that has just lost its
+ * context cannot be expected to know the session id it was working on, so the
+ * binding in the worktree is what identifies it.
+ */
+function status(args) {
+  const { repo, ledger } = ledgerFor(args);
+  const bindingPath = path.join(repo.root, '.agent-team-binding.json');
+  const binding = fs.existsSync(bindingPath) ? readJson(bindingPath) : null;
+  const subject = binding ? `agent:${binding.agentId}` : null;
+
+  runLedger(() => {
+    const sessions = ledger.listSessions().map((sessionId) => {
+      const session = ledger.readSession(sessionId);
+      const tasks = ledger.listTasks(sessionId)
+        .map((taskId) => ledger.readTask(sessionId, taskId))
+        .filter((record) => subject === null || record.frozen.subject === subject)
+        .map((record) => ({
+          taskId: record.frozen.taskId,
+          status: record.state.status,
+          generation: record.state.generation,
+          role: record.frozen.role,
+          baseRevision: record.frozen.baseRevision,
+          inputSnapshotDigest: record.inputSnapshotDigest,
+        }));
+      return { sessionId, status: session.status, integrationTarget: session.integrationTarget, tasks };
+    });
+    emit({
+      agent: binding ? { agentId: binding.agentId, role: binding.role } : null,
+      repo: { root: repo.root, commonDir: repo.commonDir },
+      // Only sessions this agent has work in, unless it has no binding at all.
+      sessions: sessions.filter((session) => subject === null || session.tasks.length > 0),
+    });
+  });
+}
 function usage() {
   console.log(`Persistent Agent Team helper\n\n` +
-    `Commands:\n` +
+    `Identity:\n` +
     `  setup  --agent-id <id> --role <${roleIds().join('|')}> --harness <claude-code|codex|gemini-cli|generic> [--repo .] [--force]\n` +
     `  doctor [--repo .]\n` +
     `  show   [--repo .]\n\n` +
+    `Session ledger (in the Git common dir, so all linked worktrees share one):\n` +
+    `  status                        Where am I? Sessions and tasks belonging to this worktree's agent\n` +
+    `  session start      --session <id> --target <branch> [--provider spec-suite] [--note ...]\n` +
+    `  session list\n` +
+    `  session show       --session <id>\n` +
+    `  session set-status --session <id> --status <status> [--expect-revision N] [--note ...]\n` +
+    `  session events     --session <id> [--kind <event-kind>]\n` +
+    `  task issue         --packet <file.json> [--session <id>] [--expect-revision N]\n` +
+    `  task reissue       --packet <file.json> --reason <why> [--expect-generation N]\n` +
+    `  task show          --session <id> --task <id>\n` +
+    `  task set-status    --session <id> --task <id> --status <status> [--expect-revision N] [--note ...]\n\n` +
+    `  session status: ${SESSION_STATUSES.join(', ')}\n` +
+    `  task status:    ${TASK_STATUSES.join(', ')}\n\n` +
+    `Exit codes:\n` +
+    `  0 ok   1 usage error   2 unhealthy (doctor)   3 ledger refused   4 refused but retryable (re-read, retry)\n\n` +
     `Environment:\n` +
     `  AGENT_TEAM_HOME   Durable identity root (default ~/.agent-team)\n`);
 }
@@ -394,4 +613,7 @@ if (!command || command === 'help' || args.help) {
 if (command === 'setup') setup(args);
 else if (command === 'doctor') doctor(args);
 else if (command === 'show') show(args);
+else if (command === 'status') status(args);
+else if (command === 'session') sessionCommand(args);
+else if (command === 'task') taskCommand(args);
 else die(`unknown command ${command}`);

@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/crazycola23/team-layer/schemas/id.schema.json",
+  "title": "Ledger id",
+  "description": "A session or task id: lowercase \"scheme:name\". `_` and `.` are excluded so the id maps injectively onto one path segment and cannot express traversal.",
+  "x-generated-from": "src/slug.mjs ID_PATTERN",
+  "type": "string",
+  "maxLength": 120,
+  "pattern": "^(?:[a-z][a-z0-9-]*:)?[a-z0-9][a-z0-9-]*$"
+}

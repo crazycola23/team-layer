@@ -1,0 +1,475 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { spawn, spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+
+import { Ledger, LedgerError, SESSION_STATUSES, SESSION_TRANSITIONS, TASK_STATUSES, TASK_TRANSITIONS } from '../src/ledger.mjs';
+import { slug, unslug, assertId, SlugError } from '../src/slug.mjs';
+import { loadSchema, validate } from '../src/schema.mjs';
+import { jsonDigest, DigestError } from '../src/digest.mjs';
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const SESSION_SCHEMA = loadSchema(path.join(ROOT, 'schemas', 'session.schema.json'));
+const TASK_SCHEMA = loadSchema(path.join(ROOT, 'schemas', 'task-record.schema.json'));
+
+function tempCommonDir() {
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'team-layer-ledger-'));
+}
+
+function tempLedger(options = {}) {
+  return new Ledger({ commonDir: tempCommonDir(), actor: 'test', ...options });
+}
+
+/**
+ * The code of the refusal, or null if the call was allowed.
+ *
+ * All three error classes are in scope on purpose: the ledger delegates id and
+ * revision checks, so a caller sees SlugError/DigestError codes through it and
+ * a test that only understood LedgerError would rethrow a correct rejection.
+ */
+function code(fn) {
+  try {
+    fn();
+  } catch (error) {
+    const known = error instanceof LedgerError || error instanceof SlugError || error instanceof DigestError;
+    if (!known) throw error;
+    return error.code;
+  }
+  return null;
+}
+
+/** A pid that is provably gone: the process ran to completion before we asked. */
+function deadPid() {
+  const child = spawnSync(process.execPath, ['-e', ''], { encoding: 'utf8' });
+  assert.equal(child.status, 0);
+  assert.ok(Number.isInteger(child.pid));
+  return child.pid;
+}
+
+function packet(overrides = {}) {
+  return {
+    schemaVersion: 1,
+    taskId: 'task:coupon',
+    subject: 'agent:fullstack-01',
+    role: 'fullstack',
+    baseRevision: 'git:abc1234',
+    readSet: ['src/**'],
+    writeSet: ['src/**'],
+    inputs: [{ id: 'contract:coupon', revision: `sha256:${'1'.repeat(64)}`, authority: 'product-architect' }],
+    acceptance: ['AC-1'],
+    validation: ['npm test'],
+    ...overrides,
+  };
+}
+
+function startedSession({ sessionId = 'feature:coupon', ...options } = {}) {
+  const ledger = tempLedger(options);
+  ledger.createSession({ sessionId, integrationTarget: 'main' });
+  return { ledger, sessionId };
+}
+
+// ------------------------------------------------------------------------- slugs
+// A session id is not a filename. `:` is illegal on Windows, so the mapping has
+// to exist; it has to be injective or two sessions would share one ledger.
+test('ids map to filesystem-safe segments injectively', () => {
+  assert.equal(slug('feature:coupon'), 'feature__coupon');
+  assert.equal(slug('coupon'), 'coupon');
+  assert.equal(unslug(slug('feature:coupon')), 'feature:coupon');
+
+  // `_` is not a legal id character, which is what makes `__` an unambiguous
+  // stand-in for `:` rather than something an id could contain itself.
+  assert.equal(code(() => assertId('feature__coupon')), 'MALFORMED_ID');
+  assert.notEqual(slug('a:b-c'), slug('a-b:c'));
+});
+
+test('ids that could escape the ledger directory are rejected', () => {
+  for (const bad of ['..', '../x', 'a/b', 'a\\b', 'feature:../x', '.', 'a.b', 'A', '', 'a:', ':a', 'a:b:c', 'x'.repeat(200)]) {
+    assert.equal(code(() => assertId(bad)), 'MALFORMED_ID', `expected ${JSON.stringify(bad)} to be rejected`);
+  }
+});
+
+// ----------------------------------------------------------------------- session
+test('a new session is forming, schema-valid, and recorded as one event', () => {
+  const ledger = tempLedger();
+  const session = ledger.createSession({ sessionId: 'feature:coupon', integrationTarget: 'main' });
+  assert.equal(session.status, 'forming');
+  assert.equal(session.revision, 1);
+  assert.equal(session.eventSeq, 1);
+  assert.deepEqual(validate(SESSION_SCHEMA, session), []);
+
+  const events = ledger.readEvents('feature:coupon', { expectSeq: session.eventSeq });
+  assert.equal(events.length, 1);
+  assert.equal(events[0].kind, 'session-created');
+  assert.equal(events[0].seq, 1);
+  assert.deepEqual(ledger.listSessions(), ['feature:coupon']);
+});
+
+test('creating a session twice fails closed instead of adopting the existing one', () => {
+  const { ledger } = startedSession();
+  assert.equal(code(() => ledger.createSession({ sessionId: 'feature:coupon', integrationTarget: 'main' })), 'SESSION_EXISTS');
+  // The original state survives the refused write.
+  assert.equal(ledger.readSession('feature:coupon').revision, 1);
+});
+
+test('the session status machine is closed and every transition is checked', () => {
+  // Every status is reachable from the table, and the table only names statuses
+  // that exist. A typo in either list is otherwise invisible until runtime.
+  assert.deepEqual(Object.keys(SESSION_TRANSITIONS).sort(), [...SESSION_STATUSES].sort());
+  for (const [from, targets] of Object.entries(SESSION_TRANSITIONS)) {
+    for (const to of targets) {
+      assert.ok(SESSION_STATUSES.includes(to), `${from} -> ${to} names an unknown status`);
+    }
+  }
+
+  const { ledger, sessionId } = startedSession();
+  assert.equal(code(() => ledger.setSessionStatus(sessionId, 'integration')), 'ILLEGAL_TRANSITION');
+  assert.equal(code(() => ledger.setSessionStatus(sessionId, 'forming')), 'NO_OP_TRANSITION');
+  assert.equal(code(() => ledger.setSessionStatus(sessionId, 'nonsense')), 'UNKNOWN_STATUS');
+  // A refused transition must not have consumed a revision or an event.
+  const untouched = ledger.readSession(sessionId);
+  assert.equal(untouched.revision, 1);
+  assert.equal(untouched.eventSeq, 1);
+
+  const walk = ['product-definition', 'ready-for-implementation', 'implementation', 'review', 'integration', 'completed'];
+  let revision = 1;
+  for (const status of walk) {
+    const next = ledger.setSessionStatus(sessionId, status);
+    assert.equal(next.status, status);
+    assert.equal(next.revision, ++revision);
+  }
+  assert.equal(code(() => ledger.setSessionStatus(sessionId, 'implementation')), 'ILLEGAL_TRANSITION', 'completed is terminal');
+});
+
+test('blocked resumes only into a working state', () => {
+  const { ledger, sessionId } = startedSession();
+  ledger.setSessionStatus(sessionId, 'product-definition');
+  ledger.setSessionStatus(sessionId, 'blocked', { note: 'waiting on the coupon contract' });
+  assert.equal(ledger.readSession(sessionId).notes, 'waiting on the coupon contract');
+  assert.equal(code(() => ledger.setSessionStatus(sessionId, 'completed')), 'ILLEGAL_TRANSITION');
+  assert.equal(code(() => ledger.setSessionStatus(sessionId, 'forming')), 'ILLEGAL_TRANSITION');
+  assert.equal(ledger.setSessionStatus(sessionId, 'implementation').status, 'implementation');
+});
+
+test('a stale expectedRevision is refused rather than overwriting', () => {
+  const { ledger, sessionId } = startedSession();
+  const read = ledger.readSession(sessionId);
+  ledger.setSessionStatus(sessionId, 'product-definition');
+
+  // `read` is now out of date. A writer holding it must not win.
+  const error = (() => {
+    try {
+      ledger.setSessionStatus(sessionId, 'blocked', { expectedRevision: read.revision });
+      return null;
+    } catch (e) {
+      return e;
+    }
+  })();
+  assert.equal(error.code, 'REVISION_CONFLICT');
+  assert.deepEqual(error.details, { expected: 1, actual: 2 });
+  assert.equal(ledger.readSession(sessionId).status, 'product-definition', 'the refused write changed nothing');
+
+  // Re-reading and retrying is the documented recovery.
+  assert.equal(ledger.setSessionStatus(sessionId, 'blocked', { expectedRevision: 2 }).status, 'blocked');
+});
+
+// -------------------------------------------------------------------------- tasks
+test('an issued task is schema-valid and splits frozen truth from mutable state', () => {
+  const { ledger, sessionId } = startedSession();
+  const record = ledger.issueTask({ sessionId, packet: packet() });
+  assert.deepEqual(validate(TASK_SCHEMA, record), []);
+  assert.equal(record.state.status, 'issued');
+  assert.equal(record.state.generation, 1);
+  assert.equal(record.frozen.sessionId, sessionId);
+  assert.equal(record.frozenDigest, jsonDigest(record.frozen));
+  assert.deepEqual(ledger.listTasks(sessionId), ['task:coupon']);
+});
+
+test('the frozen digest depends only on content, not on when or how often it was issued', () => {
+  const a = startedSession();
+  const b = startedSession();
+  const first = a.ledger.issueTask({ sessionId: a.sessionId, packet: packet() });
+  const second = b.ledger.issueTask({ sessionId: b.sessionId, packet: packet() });
+  assert.equal(first.frozenDigest, second.frozenDigest);
+  assert.equal(first.inputSnapshotDigest, second.inputSnapshotDigest);
+});
+
+test('editing a frozen packet on disk is detected instead of obeyed', () => {
+  const { ledger, sessionId } = startedSession();
+  ledger.issueTask({ sessionId, packet: packet() });
+  const file = ledger.taskFile(sessionId, 'task:coupon');
+
+  const record = JSON.parse(fs.readFileSync(file, 'utf8'));
+  record.frozen.acceptance = ['AC-1', 'AC-2-snuck-in'];
+  fs.writeFileSync(file, JSON.stringify(record, null, 2), 'utf8');
+
+  const error = (() => {
+    try {
+      ledger.readTask(sessionId, 'task:coupon');
+      return null;
+    } catch (e) {
+      return e;
+    }
+  })();
+  assert.equal(error.code, 'FROZEN_TAMPERED');
+  assert.match(error.message, /Reissue the task/);
+  // Every path that relies on frozen truth goes through readTask, so the
+  // tampered packet cannot be laundered through a status change either.
+  assert.equal(code(() => ledger.setTaskStatus(sessionId, 'task:coupon', 'in-progress')), 'FROZEN_TAMPERED');
+});
+
+test('the task status machine is closed and completed tasks are not reopened', () => {
+  assert.deepEqual(Object.keys(TASK_TRANSITIONS).sort(), [...TASK_STATUSES].sort());
+  const { ledger, sessionId } = startedSession();
+  ledger.issueTask({ sessionId, packet: packet() });
+  assert.equal(code(() => ledger.setTaskStatus(sessionId, 'task:coupon', 'completed')), 'ILLEGAL_TRANSITION');
+  ledger.setTaskStatus(sessionId, 'task:coupon', 'in-progress');
+  ledger.setTaskStatus(sessionId, 'task:coupon', 'blocked', { note: 'contract ambiguous' });
+  assert.equal(ledger.readTask(sessionId, 'task:coupon').state.note, 'contract ambiguous');
+  ledger.setTaskStatus(sessionId, 'task:coupon', 'in-progress');
+  const done = ledger.setTaskStatus(sessionId, 'task:coupon', 'completed');
+  assert.equal(done.state.status, 'completed');
+  assert.equal(code(() => ledger.setTaskStatus(sessionId, 'task:coupon', 'in-progress')), 'ILLEGAL_TRANSITION');
+});
+
+test('issuing the same task twice is refused; restating it is explicit', () => {
+  const { ledger, sessionId } = startedSession();
+  ledger.issueTask({ sessionId, packet: packet() });
+  assert.equal(code(() => ledger.issueTask({ sessionId, packet: packet() })), 'TASK_EXISTS');
+  assert.equal(code(() => ledger.reissueTask({ sessionId, packet: packet(), reason: '' })), 'MALFORMED_TASK');
+});
+
+// Plan §17 Scenario 2: the product architect changes the contract mid-flight. The
+// old frozen truth must be superseded, never patched, and the audit log has to
+// keep enough to prove which snapshot the Agent had been working against.
+test('restating a task supersedes the old snapshot rather than editing it', () => {
+  const { ledger, sessionId } = startedSession();
+  const first = ledger.issueTask({ sessionId, packet: packet() });
+  ledger.setTaskStatus(sessionId, 'task:coupon', 'in-progress');
+
+  const moved = packet({ inputs: [{ id: 'contract:coupon', revision: `sha256:${'2'.repeat(64)}`, authority: 'product-architect' }] });
+  const second = ledger.reissueTask({ sessionId, packet: moved, reason: 'contract:coupon moved', expectedGeneration: 1 });
+
+  assert.equal(second.state.generation, 2);
+  assert.equal(second.state.status, 'issued', 'a restated task starts over');
+  assert.notEqual(second.frozenDigest, first.frozenDigest);
+  assert.notEqual(second.inputSnapshotDigest, first.inputSnapshotDigest);
+  assert.deepEqual(validate(TASK_SCHEMA, second), []);
+
+  const reissued = ledger.readEvents(sessionId).find((e) => e.kind === 'task-reissued');
+  assert.equal(reissued.reason, 'contract:coupon moved');
+  assert.equal(reissued.supersededDigest, first.frozenDigest);
+  assert.equal(reissued.supersededInputSnapshotDigest, first.inputSnapshotDigest);
+  assert.equal(reissued.unchanged, false);
+
+  assert.equal(
+    code(() => ledger.reissueTask({ sessionId, packet: moved, reason: 'again', expectedGeneration: 1 })),
+    'REVISION_CONFLICT',
+  );
+});
+
+// A freshness re-check runs on a schedule and must be safe to run on a task
+// someone is actively working on. Asserting the *whole* record is unchanged, not
+// just the digest, is what pins that down: a bumped generation would read
+// downstream as "your task was restated", and a reset status would throw away
+// the fact that an Agent is mid-flight — both invented by a check that found
+// nothing had moved.
+test('restating with identical content is recorded as unchanged, not as a new snapshot', () => {
+  const { ledger, sessionId } = startedSession();
+  const first = ledger.issueTask({ sessionId, packet: packet() });
+  ledger.setTaskStatus(sessionId, 'task:coupon', 'in-progress');
+  const working = ledger.readTask(sessionId, 'task:coupon');
+
+  const again = ledger.reissueTask({ sessionId, packet: packet(), reason: 'periodic freshness re-check' });
+  assert.equal(again.frozenDigest, first.frozenDigest, 'same agreed truth keeps the same digest');
+  assert.equal(again.state.generation, 1, 'a no-op restatement does not invent a generation');
+  assert.equal(again.state.status, 'in-progress', 'a no-op restatement does not derail work in progress');
+  assert.deepEqual(ledger.readTask(sessionId, 'task:coupon'), working, 'the stored task was not touched at all');
+
+  // The check itself is still auditable: it happened, at a time, for a reason.
+  const event = ledger.readEvents(sessionId).find((e) => e.kind === 'task-reissued');
+  assert.equal(event.unchanged, true);
+  assert.equal(event.reason, 'periodic freshness re-check');
+  assert.equal(event.generation, 1);
+
+  // And the CAS still refers to the generation that is actually current, so a
+  // scheduled re-check cannot invalidate a holder that has not been superseded.
+  assert.equal(code(() => ledger.reissueTask({
+    sessionId, packet: packet(), reason: 'again', expectedGeneration: 1,
+  })), null);
+});
+
+test('a cancelled task cannot be revived by restating it', () => {
+  const { ledger, sessionId } = startedSession();
+  ledger.issueTask({ sessionId, packet: packet() });
+  ledger.setTaskStatus(sessionId, 'task:coupon', 'cancelled');
+  assert.equal(code(() => ledger.reissueTask({ sessionId, packet: packet(), reason: 'oops' })), 'ILLEGAL_TRANSITION');
+});
+
+test('a packet cannot smuggle in ledger-owned fields', () => {
+  const { ledger, sessionId } = startedSession();
+  assert.equal(code(() => ledger.issueTask({ sessionId, packet: packet({ generation: 7 }) })), 'MALFORMED_TASK');
+  assert.equal(code(() => ledger.issueTask({ sessionId, packet: packet({ sessionId: 'feature:other' }) })), 'SESSION_MISMATCH');
+  assert.equal(code(() => ledger.issueTask({ sessionId, packet: packet({ baseRevision: 'git:zzz' }) })), 'MALFORMED_REVISION');
+  assert.equal(code(() => ledger.issueTask({ sessionId, packet: packet({ taskId: '../escape' }) })), 'MALFORMED_ID');
+  assert.deepEqual(ledger.listTasks(sessionId), [], 'no half-written task survived a rejected issue');
+});
+
+// ------------------------------------------------------------------ audit log
+test('the event log is authoritative and truncation is reported, not absorbed', () => {
+  const { ledger, sessionId } = startedSession();
+  ledger.issueTask({ sessionId, packet: packet() });
+  ledger.setTaskStatus(sessionId, 'task:coupon', 'in-progress');
+  const session = ledger.readSession(sessionId);
+  const events = ledger.readEvents(sessionId, { expectSeq: session.eventSeq });
+  assert.deepEqual(events.map((e) => e.kind), ['session-created', 'task-issued', 'task-status-changed']);
+  assert.deepEqual(events.map((e) => e.seq), [1, 2, 3], 'sequence numbers are gap-free');
+  for (const event of events) assert.equal(event.actor, 'test');
+
+  const file = ledger.eventsFile(sessionId);
+  const text = fs.readFileSync(file, 'utf8');
+
+  // A crash mid-append leaves a partial line. Parsing what survives and calling
+  // it the history would silently under-count everything derived from the log.
+  fs.writeFileSync(file, `${text}{"seq":4,"kind":"tor`, 'utf8');
+  assert.equal(code(() => ledger.readEvents(sessionId)), 'LEDGER_CORRUPT');
+
+  fs.writeFileSync(file, text.split('\n').slice(1).join('\n'), 'utf8');
+  const error = (() => {
+    try {
+      ledger.readEvents(sessionId, { expectSeq: session.eventSeq });
+      return null;
+    } catch (e) {
+      return e;
+    }
+  })();
+  assert.equal(error.code, 'LEDGER_CORRUPT');
+  assert.deepEqual(error.details, { found: 2, expected: 3 });
+});
+
+// ------------------------------------------------------------------------ locking
+test('a lock left behind by a dead process on this host is reclaimed', () => {
+  const { ledger, sessionId } = startedSession();
+  const lockDir = path.join(ledger.sessionDir(sessionId), '.lock');
+  fs.mkdirSync(lockDir);
+  // Liveness is what decides, not age: this holder's timestamp is recent, and it
+  // is still reclaimed because the process behind it is gone.
+  fs.writeFileSync(
+    path.join(lockDir, 'holder.json'),
+    JSON.stringify({ pid: deadPid(), host: os.hostname(), actor: 'crashed-window', at: new Date().toISOString() }),
+    'utf8',
+  );
+  assert.equal(ledger.setSessionStatus(sessionId, 'product-definition').status, 'product-definition');
+});
+
+test('a lock held by a live process fails closed with a machine-readable error', () => {
+  const { ledger, sessionId } = startedSession({ lockTimeoutMs: 150 });
+  const lockDir = path.join(ledger.sessionDir(sessionId), '.lock');
+  fs.mkdirSync(lockDir);
+  fs.writeFileSync(
+    path.join(lockDir, 'holder.json'),
+    JSON.stringify({ pid: process.pid, host: os.hostname(), actor: 'other-window', at: new Date().toISOString() }),
+    'utf8',
+  );
+  const error = (() => {
+    try {
+      ledger.setSessionStatus(sessionId, 'product-definition');
+      return null;
+    } catch (e) {
+      return e;
+    }
+  })();
+  assert.equal(error.code, 'LOCK_HELD');
+  assert.match(error.message, /still running/);
+  assert.equal(error.details.holder.actor, 'other-window');
+  assert.equal(ledger.readSession(sessionId).status, 'forming', 'nothing was written while locked out');
+});
+
+test('a lock held by another host is never reclaimed on age alone', () => {
+  const { ledger, sessionId } = startedSession({ lockTimeoutMs: 150 });
+  const lockDir = path.join(ledger.sessionDir(sessionId), '.lock');
+  fs.mkdirSync(lockDir);
+  fs.writeFileSync(
+    path.join(lockDir, 'holder.json'),
+    // Long dead by wall clock, and its pid does not exist here either — but it
+    // is not this machine's pid space, so liveness is unknowable.
+    JSON.stringify({ pid: 4242, host: 'some-other-machine', actor: 'ci', at: '2020-01-01T00:00:00.000Z' }),
+    'utf8',
+  );
+  const error = (() => {
+    try {
+      ledger.setSessionStatus(sessionId, 'product-definition');
+      return null;
+    } catch (e) {
+      return e;
+    }
+  })();
+  assert.equal(error.code, 'LOCK_HELD');
+  assert.match(error.message, /Liveness cannot be checked/);
+});
+
+test('the lock is released even when the guarded work throws', () => {
+  const { ledger, sessionId } = startedSession({ lockTimeoutMs: 150 });
+  assert.throws(() => ledger.withLock(sessionId, () => {
+    throw new Error('boom');
+  }), /boom/);
+  assert.ok(!fs.existsSync(path.join(ledger.sessionDir(sessionId), '.lock')));
+  assert.equal(ledger.setSessionStatus(sessionId, 'product-definition').status, 'product-definition');
+});
+
+// Plan §17 Scenario 7: two worktrees updating one session at the same time. Real
+// concurrency needs real processes — an in-process loop would prove nothing about
+// a lock whose whole job is to coordinate across processes. The children wait on a
+// start file so they are all inside the contended region together, rather than
+// finishing one after another and never meeting.
+test('concurrent writers from separate processes lose no update and corrupt nothing', async () => {
+  const commonDir = tempCommonDir();
+  const ledger = new Ledger({ commonDir, actor: 'test' });
+  const sessionId = 'feature:coupon';
+  ledger.createSession({ sessionId, integrationTarget: 'main' });
+
+  const WRITERS = 4;
+  const PER_WRITER = 5;
+  const worker = path.join(ROOT, 'tests', 'helpers', 'concurrent-writer.mjs');
+  const goFile = path.join(commonDir, 'go');
+
+  const children = Array.from({ length: WRITERS }, (_, index) => {
+    const child = spawn(
+      process.execPath,
+      [worker, commonDir, sessionId, String(index), String(PER_WRITER), goFile],
+      { stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    let output = '';
+    child.stdout.on('data', (chunk) => { output += chunk; });
+    child.stderr.on('data', (chunk) => { output += chunk; });
+    return new Promise((resolve) => {
+      child.on('close', (status) => resolve({ index, status, output }));
+    });
+  });
+
+  fs.writeFileSync(goFile, 'go', 'utf8');
+  const results = await Promise.all(children);
+  for (const result of results) {
+    assert.equal(result.status, 0, `writer ${result.index} failed:\n${result.output}`);
+  }
+
+  const session = ledger.readSession(sessionId);
+  const events = ledger.readEvents(sessionId, { expectSeq: session.eventSeq });
+
+  // Every write landed: no interleaving silently dropped one.
+  const issued = events.filter((e) => e.kind === 'task-issued');
+  assert.equal(issued.length, WRITERS * PER_WRITER, 'every issued task is in the log exactly once');
+  assert.equal(ledger.listTasks(sessionId).length, WRITERS * PER_WRITER);
+  assert.deepEqual(events.map((e) => e.seq), events.map((_, i) => i + 1), 'sequence numbers are gap-free and unique');
+
+  // And everything is still readable and internally consistent.
+  assert.deepEqual(validate(SESSION_SCHEMA, session), []);
+  for (const taskId of ledger.listTasks(sessionId)) {
+    assert.deepEqual(validate(TASK_SCHEMA, ledger.readTask(sessionId, taskId)), [], taskId);
+  }
+  assert.ok(!fs.existsSync(path.join(ledger.sessionDir(sessionId), '.lock')), 'no writer leaked the lock');
+  const leftovers = fs.readdirSync(path.join(ledger.sessionDir(sessionId), 'tasks')).filter((n) => n.includes('.tmp-'));
+  assert.deepEqual(leftovers, [], 'no temp files were left behind');
+});

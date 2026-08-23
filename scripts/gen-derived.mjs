@@ -13,6 +13,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { inputSnapshotDigest, DigestError, REVISION_PATTERN, DIGEST_PATTERN, GIT_REVISION_PATTERN } from '../src/digest.mjs';
+import { SESSION_STATUSES, TASK_STATUSES } from '../src/ledger.mjs';
+import { ID_PATTERN, MAX_ID_LENGTH } from '../src/slug.mjs';
 import { SKILL_ROOT, roleIds, registryDigest } from '../src/roles.mjs';
 
 const check = process.argv.includes('--check');
@@ -74,6 +76,47 @@ emit('schemas/git-revision.schema.json', {
   'x-generated-from': 'src/digest.mjs GIT_REVISION_PATTERN',
   type: 'string',
   pattern: GIT_REVISION_PATTERN,
+});
+
+// -------------------------------------------------------------------- id schema
+// Session and task ids are also directory names. `assertId` is what actually
+// guards the filesystem, so the schema has to describe exactly the same set: an
+// id that validated but failed `assertId` would be rejected only once something
+// tried to open its ledger directory, and one that passed `assertId` but failed
+// validation could not be written down at all.
+emit('schemas/id.schema.json', {
+  $schema: 'https://json-schema.org/draft/2020-12/schema',
+  $id: 'https://github.com/crazycola23/team-layer/schemas/id.schema.json',
+  title: 'Ledger id',
+  description: 'A session or task id: lowercase "scheme:name". `_` and `.` are excluded so the id maps injectively onto one path segment and cannot express traversal.',
+  'x-generated-from': 'src/slug.mjs ID_PATTERN',
+  type: 'string',
+  maxLength: MAX_ID_LENGTH,
+  pattern: ID_PATTERN,
+});
+
+// --------------------------------------------------------------- status schemas
+// The transition tables in src/ledger.mjs are the authority: a status that is
+// legal in a schema but unknown to the state machine would be accepted into an
+// artifact and then rejected on the next transition.
+emit('schemas/session-status.schema.json', {
+  $schema: 'https://json-schema.org/draft/2020-12/schema',
+  $id: 'https://github.com/crazycola23/team-layer/schemas/session-status.schema.json',
+  title: 'Session status',
+  description: 'Plan §3.2. Legal transitions live in SESSION_TRANSITIONS in src/ledger.mjs.',
+  'x-generated-from': 'src/ledger.mjs SESSION_STATUSES',
+  type: 'string',
+  enum: SESSION_STATUSES,
+});
+
+emit('schemas/task-status.schema.json', {
+  $schema: 'https://json-schema.org/draft/2020-12/schema',
+  $id: 'https://github.com/crazycola23/team-layer/schemas/task-status.schema.json',
+  title: 'Task status',
+  description: 'The mutable half of a task. Frozen truth is restated, never reopened, so there is no "stale" status here: staleness is derived by comparing inputSnapshotDigest against current canonical revisions.',
+  'x-generated-from': 'src/ledger.mjs TASK_STATUSES',
+  type: 'string',
+  enum: TASK_STATUSES,
 });
 
 // -------------------------------------------------- input snapshot test vectors

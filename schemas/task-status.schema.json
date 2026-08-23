@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/crazycola23/team-layer/schemas/task-status.schema.json",
+  "title": "Task status",
+  "description": "The mutable half of a task. Frozen truth is restated, never reopened, so there is no \"stale\" status here: staleness is derived by comparing inputSnapshotDigest against current canonical revisions.",
+  "x-generated-from": "src/ledger.mjs TASK_STATUSES",
+  "type": "string",
+  "enum": [
+    "issued",
+    "in-progress",
+    "blocked",
+    "completed",
+    "cancelled"
+  ]
+}

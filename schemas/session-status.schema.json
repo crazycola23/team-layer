@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/crazycola23/team-layer/schemas/session-status.schema.json",
+  "title": "Session status",
+  "description": "Plan §3.2. Legal transitions live in SESSION_TRANSITIONS in src/ledger.mjs.",
+  "x-generated-from": "src/ledger.mjs SESSION_STATUSES",
+  "type": "string",
+  "enum": [
+    "forming",
+    "product-definition",
+    "ready-for-implementation",
+    "implementation",
+    "review",
+    "changes-requested",
+    "integration",
+    "blocked",
+    "completed",
+    "cancelled"
+  ]
+}
