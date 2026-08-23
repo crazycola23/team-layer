@@ -164,6 +164,12 @@ function writePacket(f, packet, name = 'packet.json') {
   return file;
 }
 
+function writeDraft(f, draft, name = 'draft.json') {
+  const file = path.join(f.repo, name);
+  fs.writeFileSync(file, `${JSON.stringify(draft, null, 2)}\n`);
+  return file;
+}
+
 /** The refusal a command produced: `{code, exit}`, or null if it was allowed. */
 function refusal(args, f) {
   const res = spawnSync(process.execPath, [CLI, ...args], {
@@ -340,4 +346,168 @@ test('status answers "where am I?" from the binding alone', () => {
   // session has to work out which rows are its own, and that is the one question
   // it is least able to answer.
   assert.deepEqual(out.sessions[0].tasks.map((t) => t.taskId), ['task:coupon-api']);
+});
+
+/**
+ * The §4 path end to end, across two worktrees: Fullstack publishes state, the
+ * Reviewer's `inbox` shows it without being told which session to look in, and
+ * acknowledging clears it.
+ *
+ * Two worktrees rather than one, because that is the situation the layer exists
+ * for — the addressing has to work when the sender and recipient are separate
+ * processes with separate bindings that only share the ledger.
+ */
+test('a handoff crosses worktrees and lands in the recipient inbox', () => {
+  const f = bootstrapped({ agentId: 'fullstack-01', role: 'fullstack' });
+  run(['session', 'start', '--session', 'feature:coupon', '--target', 'main'], f);
+  writePacket(f, taskPacket());
+  run(['task', 'issue', '--packet', 'packet.json'], f);
+
+  const linked = path.join(f.dir, 'wt-reviewer');
+  git(['worktree', 'add', linked, '-b', 'review'], f.repo);
+  const g = { dir: f.dir, repo: linked, home: f.home };
+  run(['setup', '--agent-id', 'reviewer-01', '--role', 'reviewer', '--harness', 'codex', '--repo', '.'], g);
+
+  writeDraft(f, {
+    sessionId: 'feature:coupon',
+    taskId: 'task:coupon-api',
+    to: { role: 'reviewer' },
+    nextAction: 'review',
+    summary: 'Discount is applied once, in the domain layer; the API only validates shape.',
+    artifacts: [{ type: 'code', id: 'module:coupon', revision: 'git:abc1234' }],
+    evidence: [{ kind: 'validation', detail: 'npm test', result: '73 passing' }],
+    unresolved: ['Expired coupon on a saved cart is still unspecified.'],
+  });
+  const published = JSON.parse(run(['handoff', 'publish', '--handoff', 'draft.json'], f).stdout);
+  assert.equal(published.handoffId, 'handoff:fullstack-to-reviewer-1');
+  // The role came from the binding, not the draft: a publisher that could assert
+  // any role would make `to.role` addressing meaningless.
+  assert.deepEqual(published.handoff.from, { subject: 'agent:fullstack-01', role: 'fullstack' });
+
+  // And --role cannot override it while a binding exists, for the same reason
+  // --actor cannot override the actor: a claimed capacity nobody granted would let
+  // one agent publish work into another role's queue as if it held that role. The
+  // flag stays for what it is meant for — a worktree with no binding yet.
+  writeDraft(f, {
+    sessionId: 'feature:coupon', taskId: 'task:coupon-api', to: { role: 'product-architect' },
+    nextAction: 'clarify', summary: 'Published while claiming a role this agent does not hold.',
+  }, 'draft-2.json');
+  const claimed = JSON.parse(run(['handoff', 'publish', '--handoff', 'draft-2.json',
+    '--role', 'product-architect'], f).stdout);
+  assert.equal(claimed.handoff.from.role, 'fullstack');
+  assert.equal(claimed.handoffId, 'handoff:fullstack-to-product-architect-2');
+
+  // The reviewer asks what is waiting for it, naming neither session nor task —
+  // this is the command an agent runs when it has just lost its context.
+  const inbox = JSON.parse(run(['inbox'], g).stdout);
+  assert.deepEqual(inbox.map((row) => [row.handoffId, row.nextAction, row.stale]),
+    [['handoff:fullstack-to-reviewer-1', 'review', false]]);
+  assert.equal(inbox[0].sessionId, 'feature:coupon');
+  assert.equal(inbox[0].unresolved, 1);
+
+  // `--role` cannot redirect a bound worktree's inbox either. Reading another role's
+  // queue is the harmless half; the same precedence decides who may ack out of it,
+  // and one expression serves both, so it is asserted where the flag is tempting.
+  assert.deepEqual(JSON.parse(run(['inbox', '--role', 'reviewer'], f).stdout), [],
+    'the fullstack worktree sees the fullstack queue, whatever --role claims');
+
+  // Acked while claiming a role that is not the addressee: it succeeds, which is the
+  // proof the binding won — had the flag won, the addressee check would have refused.
+  run(['handoff', 'ack', '--session', 'feature:coupon', '--handoff', inbox[0].handoffId,
+    '--role', 'product-architect'], g);
+  assert.deepEqual(JSON.parse(run(['inbox'], g).stdout), [], 'an acked handoff leaves the queue');
+  assert.deepEqual(JSON.parse(run(['inbox'], f).stdout), [],
+    'and it was never in the sender’s queue to begin with');
+
+  const events = JSON.parse(run(['session', 'events', '--session', 'feature:coupon'], f).stdout);
+  assert.deepEqual(events.filter((e) => e.kind.startsWith('handoff-')).map((e) => [e.kind, e.actor]), [
+    ['handoff-published', 'agent:fullstack-01'],
+    ['handoff-published', 'agent:fullstack-01'],
+    ['handoff-acked', 'agent:reviewer-01'],
+  ]);
+});
+
+/**
+ * Plan §2.3 `stale-input` at the CLI boundary.
+ *
+ * The exit code is the assertion that matters: 3 means "do not retry, the inputs
+ * moved", and an agent that saw the retryable 4 would loop until it gave up
+ * instead of asking for a fresh handoff.
+ */
+test('the CLI refuses to acknowledge a handoff whose inputs have moved, unretryably', () => {
+  const f = bootstrapped({ agentId: 'fullstack-01', role: 'fullstack' });
+  run(['session', 'start', '--session', 'feature:coupon', '--target', 'main'], f);
+  writePacket(f, taskPacket());
+  run(['task', 'issue', '--packet', 'packet.json'], f);
+  writeDraft(f, {
+    sessionId: 'feature:coupon', taskId: 'task:coupon-api', to: { role: 'reviewer' },
+    nextAction: 'review', summary: 'Ready for review.',
+  });
+  run(['handoff', 'publish', '--handoff', 'draft.json'], f);
+
+  // The refusal has to be reachable by the addressee, because the addressee is who
+  // discovers it: acking is the last cheap moment before the work exists.
+  const linked = path.join(f.dir, 'wt-reviewer');
+  git(['worktree', 'add', linked, '-b', 'review'], f.repo);
+  const g = { dir: f.dir, repo: linked, home: f.home };
+  run(['setup', '--agent-id', 'reviewer-01', '--role', 'reviewer', '--harness', 'codex', '--repo', '.'], g);
+
+  writePacket(f, taskPacket({
+    inputs: [{ id: 'contract:coupon', revision: `sha256:${'9'.repeat(64)}`, authority: 'product-architect' }],
+  }), 'packet-v2.json');
+  run(['task', 'reissue', '--packet', 'packet-v2.json', '--reason', 'coupon contract v2'], f);
+
+  assert.deepEqual(refusal(['handoff', 'ack', '--session', 'feature:coupon',
+    '--handoff', 'handoff:fullstack-to-reviewer-1'], g), { code: 'HANDOFF_STALE', exit: 3 });
+
+  // Still in the queue, and flagged: a refusal that also hid the work would trade a
+  // stale ack for a lost one.
+  assert.deepEqual(JSON.parse(run(['inbox'], g).stdout)
+    .map((row) => [row.handoffId, row.stale]), [['handoff:fullstack-to-reviewer-1', true]]);
+
+  // `handoff show` still works: the statement is readable, it is only acting on
+  // it that is refused. A recipient that cannot read it cannot see what moved.
+  const shown = JSON.parse(run(['handoff', 'show', '--session', 'feature:coupon',
+    '--handoff', 'handoff:fullstack-to-reviewer-1'], g).stdout);
+  assert.equal(shown.handoff.nextAction, 'review');
+});
+
+test('a handoff draft that misnames its content is refused, not published empty', () => {
+  const f = bootstrapped({ agentId: 'fullstack-01', role: 'fullstack' });
+  run(['session', 'start', '--session', 'feature:coupon', '--target', 'main'], f);
+  writePacket(f, taskPacket());
+  run(['task', 'issue', '--packet', 'packet.json'], f);
+  const base = {
+    sessionId: 'feature:coupon', taskId: 'task:coupon-api',
+    to: { role: 'reviewer' }, nextAction: 'review', summary: 'Ready.',
+  };
+
+  writeDraft(f, { ...base, artifcts: [{ type: 'code', id: 'module:x', revision: 'git:abc1234' }] });
+  assert.deepEqual(refusal(['handoff', 'publish', '--handoff', 'draft.json'], f),
+    { code: 'MALFORMED_HANDOFF', exit: 3 });
+
+  writeDraft(f, { ...base, nextAction: 'have-a-look' });
+  assert.deepEqual(refusal(['handoff', 'publish', '--handoff', 'draft.json'], f),
+    { code: 'UNKNOWN_ACTION', exit: 3 });
+
+  writeDraft(f, { ...base, handoffId: 'handoff:mine-1' });
+  assert.deepEqual(refusal(['handoff', 'publish', '--handoff', 'draft.json'], f),
+    { code: 'MALFORMED_HANDOFF', exit: 3 });
+
+  assert.deepEqual(JSON.parse(run(['handoff', 'show', '--session', 'feature:coupon'], f).stdout), [],
+    'no refused draft was published');
+});
+
+/** The shipped template must be publishable as-is, or it is documentation of a wish. */
+test('the shipped handoff template publishes with only its ids filled in', () => {
+  const f = bootstrapped({ agentId: 'fullstack-01', role: 'fullstack' });
+  run(['session', 'start', '--session', 'feature:coupon', '--target', 'main'], f);
+  writePacket(f, taskPacket());
+  run(['task', 'issue', '--packet', 'packet.json'], f);
+
+  const template = JSON.parse(fs.readFileSync(path.join(ROOT, 'templates', 'handoff.json'), 'utf8'));
+  writeDraft(f, { ...template, sessionId: 'feature:coupon', taskId: 'task:coupon-api' });
+  const published = JSON.parse(run(['handoff', 'publish', '--handoff', 'draft.json'], f).stdout);
+  assert.equal(published.seq, 1);
+  assert.ok(published.handoffDigest.startsWith('sha256:'));
 });

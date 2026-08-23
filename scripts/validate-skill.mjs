@@ -19,7 +19,8 @@ const required = [
   'schemas/id.schema.json', 'schemas/role.schema.json',
   'schemas/revision.schema.json', 'schemas/digest.schema.json', 'schemas/git-revision.schema.json',
   'schemas/session-status.schema.json', 'schemas/task-status.schema.json',
-  'templates/handoff.md', 'templates/task-packet.json', 'templates/finding.json',
+  'schemas/handoff.schema.json', 'schemas/handoff-action.schema.json',
+  'templates/handoff.md', 'templates/handoff.json', 'templates/task-packet.json', 'templates/finding.json',
   'scripts/teamctl.mjs', 'src/ledger.mjs', 'src/slug.mjs', 'src/digest.mjs', 'src/schema.mjs'
 ];
 for (const file of required) ok(fs.existsSync(path.join(ROOT, file)), `missing ${file}`);
@@ -41,6 +42,7 @@ const GENERATED = {
   'schemas/git-revision.schema.json': 'src/digest.mjs GIT_REVISION_PATTERN',
   'schemas/session-status.schema.json': 'src/ledger.mjs SESSION_STATUSES',
   'schemas/task-status.schema.json': 'src/ledger.mjs TASK_STATUSES',
+  'schemas/handoff-action.schema.json': 'src/ledger.mjs HANDOFF_ACTIONS',
 };
 for (const [file, source] of Object.entries(GENERATED)) {
   if (!fs.existsSync(path.join(ROOT, file))) continue;
@@ -50,7 +52,8 @@ for (const [file, source] of Object.entries(GENERATED)) {
 }
 
 const HAND_WRITTEN = ['schemas/identity.schema.json', 'schemas/task-packet.schema.json',
-  'schemas/finding.schema.json', 'schemas/session.schema.json', 'schemas/task-record.schema.json'];
+  'schemas/finding.schema.json', 'schemas/session.schema.json', 'schemas/task-record.schema.json',
+  'schemas/handoff.schema.json'];
 for (const file of HAND_WRITTEN) {
   if (!fs.existsSync(path.join(ROOT, file))) continue;
   const body = text(file);
@@ -120,8 +123,47 @@ const stateProps = Object.keys(recordSchema.properties.state?.properties || {});
 ok(stateProps.includes('generation'), 'task record state half must carry generation');
 ok(stateProps.includes('status'), 'task record state half must carry status');
 
-const findingSchema = JSON.parse(text('schemas/finding.schema.json'));
-ok(findingSchema.properties.severity.enum.includes('blocker'), 'finding severity lacks blocker');
+/**
+ * "A handoff is state transfer, not a transcript dump" (plan §4), made mechanical.
+ *
+ * Length caps are the whole enforcement. A prose field with no upper bound will
+ * eventually receive a pasted conversation, and once it does the recipient is back
+ * to reconstructing state by reading — which is the failure the artifact exists to
+ * prevent. So an uncapped string in the statement half is treated as a defect even
+ * though nothing is currently over-long.
+ *
+ * The digest split is checked for the same reason it is on task records: putting
+ * `publishedAt` inside `handoff` would make every republication of identical state
+ * produce a new digest, and detecting "you already told me this" is the only cheap
+ * defence against a handoff loop.
+ */
+const handoffSchema = JSON.parse(text('schemas/handoff.schema.json'));
+const statement = handoffSchema.properties.handoff;
+ok(handoffSchema.additionalProperties === false, 'handoff record must be closed');
+ok(statement?.additionalProperties === false, 'the handoff statement must be closed');
+ok(handoffSchema.properties.handoffDigest?.$ref === 'digest.schema.json',
+  'handoffDigest must $ref digest.schema.json');
+for (const circumstance of ['handoffId', 'seq', 'publishedAt', 'publishedBy', 'handoffDigest']) {
+  ok(!Object.keys(statement?.properties ?? {}).includes(circumstance),
+    `${circumstance} is circumstance, not statement; it must sit outside the digested half`);
+}
+for (const field of ['taskId', 'inputSnapshotDigest', 'nextAction', 'summary', 'unresolved']) {
+  ok(statement?.required?.includes(field), `a handoff must require ${field}`);
+}
+ok(statement.properties.nextAction?.$ref === 'handoff-action.schema.json',
+  'nextAction must $ref the generated action enum rather than inlining one');
+for (const [name, node] of [
+  ['summary', statement.properties.summary],
+  ['unresolved item', statement.properties.unresolved?.items],
+  ['evidence detail', statement.properties.evidence?.items?.properties?.detail],
+  ['evidence result', statement.properties.evidence?.items?.properties?.result],
+]) {
+  ok(typeof node?.maxLength === 'number', `handoff ${name} must be length-capped: state transfer, not transcript`);
+}
+
+JSON.parse(text('templates/handoff.json'));
+
+const findingSchema = JSON.parse(text('schemas/finding.schema.json'));ok(findingSchema.properties.severity.enum.includes('blocker'), 'finding severity lacks blocker');
 ok(findingSchema.required.includes('evidence') && findingSchema.required.includes('impact'), 'finding must require evidence + impact');
 
 JSON.parse(text('templates/task-packet.json'));

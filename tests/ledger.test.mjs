@@ -14,6 +14,7 @@ import { jsonDigest, DigestError } from '../src/digest.mjs';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const SESSION_SCHEMA = loadSchema(path.join(ROOT, 'schemas', 'session.schema.json'));
 const TASK_SCHEMA = loadSchema(path.join(ROOT, 'schemas', 'task-record.schema.json'));
+const HANDOFF_SCHEMA = loadSchema(path.join(ROOT, 'schemas', 'handoff.schema.json'));
 
 function tempCommonDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'team-layer-ledger-'));
@@ -472,4 +473,260 @@ test('concurrent writers from separate processes lose no update and corrupt noth
   assert.ok(!fs.existsSync(path.join(ledger.sessionDir(sessionId), '.lock')), 'no writer leaked the lock');
   const leftovers = fs.readdirSync(path.join(ledger.sessionDir(sessionId), 'tasks')).filter((n) => n.includes('.tmp-'));
   assert.deepEqual(leftovers, [], 'no temp files were left behind');
+});
+
+// ---------------------------------------------------------------------- handoffs
+// Plan §4. A handoff is state transfer, not a transcript dump: it names the input
+// snapshot the work was done against, what now exists, and the one next action.
+// The property that makes it worth having a schema for is the staleness check —
+// a recipient must not be able to start work against inputs that already moved.
+
+function draft(overrides = {}) {
+  return {
+    taskId: 'task:coupon',
+    to: { role: 'reviewer' },
+    nextAction: 'review',
+    summary: 'Discount applies at most once, enforced in the domain layer.',
+    ...overrides,
+  };
+}
+
+/** A session with one issued task, ready to hand off. */
+function taskedSession(options = {}) {
+  const started = startedSession(options);
+  started.ledger.issueTask({ sessionId: started.sessionId, packet: packet() });
+  return started;
+}
+
+test('a published handoff is schema-valid and the ledger owns its identity', () => {
+  const { ledger, sessionId } = taskedSession();
+  const record = ledger.publishHandoff({ sessionId, draft: draft(), actorRole: 'fullstack' });
+
+  assert.deepEqual(validate(HANDOFF_SCHEMA, record), []);
+  assert.equal(record.handoffId, 'handoff:fullstack-to-reviewer-1');
+  assert.equal(record.seq, 1);
+  assert.deepEqual(record.handoff.from, { subject: 'test', role: 'fullstack' });
+
+  // The snapshot is copied from the task, not accepted from the sender, so a
+  // handoff cannot claim to have been produced against truth that never held.
+  const task = ledger.readTask(sessionId, 'task:coupon');
+  assert.equal(record.handoff.inputSnapshotDigest, task.inputSnapshotDigest);
+
+  // Receipt is an event, so the statement stays immutable and keeps its digest.
+  const event = ledger.readEvents(sessionId).find((e) => e.kind === 'handoff-published');
+  assert.equal(event.handoffId, record.handoffId);
+  assert.equal(event.at, record.publishedAt);
+  assert.equal(event.duplicateOf, undefined);
+});
+
+/**
+ * The digest has to identify the state, not the act of transferring it.
+ *
+ * Re-sending an unacknowledged handoff is how you nudge a recipient, and it is
+ * legal — but it is not new information, and a recipient that cannot tell the
+ * difference has to re-read the whole thing to find out nothing changed. That
+ * only works while `handoffId` and `publishedAt` stay outside the digested half.
+ */
+test('re-sending the same state is recognised as a nudge, not as new state', () => {
+  const { ledger, sessionId } = taskedSession();
+  const first = ledger.publishHandoff({ sessionId, draft: draft(), actorRole: 'fullstack' });
+  const again = ledger.publishHandoff({ sessionId, draft: draft(), actorRole: 'fullstack' });
+
+  assert.equal(again.handoffDigest, first.handoffDigest, 'identical state hashes identically');
+  assert.notEqual(again.handoffId, first.handoffId, 'but it is still a distinct act, separately addressable');
+  const events = ledger.readEvents(sessionId).filter((e) => e.kind === 'handoff-published');
+  assert.deepEqual(events.map((e) => e.duplicateOf ?? null), [null, first.handoffId]);
+
+  const moved = ledger.publishHandoff({
+    sessionId, actorRole: 'fullstack',
+    draft: draft({ summary: 'Stacking with promo codes now rejects with 409.' }),
+  });
+  assert.notEqual(moved.handoffDigest, first.handoffDigest);
+  assert.equal(ledger.readEvents(sessionId).at(-1).duplicateOf, undefined);
+});
+
+test('a draft cannot assign what the ledger owns, or misspell what it does own', () => {
+  const { ledger, sessionId } = taskedSession();
+  const publish = (overrides) => code(() => ledger.publishHandoff({
+    sessionId, draft: draft(overrides), actorRole: 'fullstack',
+  }));
+
+  assert.equal(publish({ handoffId: 'handoff:mine-1' }), 'MALFORMED_HANDOFF');
+  assert.equal(publish({ from: { subject: 'agent:someone-else', role: 'reviewer' } }), 'MALFORMED_HANDOFF');
+  assert.equal(publish({ publishedBy: 'agent:someone-else' }), 'MALFORMED_HANDOFF');
+
+  // A misspelled field is refused rather than ignored. Ignoring it would publish
+  // a handoff asserting there are no artifacts, which is a claim nobody made.
+  assert.equal(publish({ artifcts: [{ type: 'code', id: 'module:x', revision: 'git:abc1234' }] }),
+    'MALFORMED_HANDOFF');
+
+  assert.equal(publish({ nextAction: 'have-a-look' }), 'UNKNOWN_ACTION');
+  assert.equal(publish({ to: { role: 'archmage' } }), 'UNKNOWN_ROLE');
+  assert.equal(publish({ summary: '   ' }), 'MALFORMED_HANDOFF');
+  assert.equal(code(() => ledger.publishHandoff({
+    sessionId, draft: draft(), actorRole: 'archmage',
+  })), 'UNKNOWN_ROLE');
+
+  assert.deepEqual(ledger.listHandoffs(sessionId), [], 'no refused draft left a file behind');
+});
+
+/**
+ * Plan §2.3 `stale-input`, enforced in the team layer.
+ *
+ * This is the scenario the whole artifact exists for: the sender hands off against
+ * a snapshot, the contract then moves, and the recipient must not be allowed to
+ * start work against superseded inputs. Acknowledging is exactly the moment before
+ * that work begins, so it is the right place to fail — and it fails closed, with no
+ * override, because an override here would become the default path.
+ */
+test('acknowledging a handoff whose inputs have moved is refused', () => {
+  const { ledger, sessionId } = taskedSession();
+  const handoff = ledger.publishHandoff({ sessionId, draft: draft(), actorRole: 'fullstack' });
+
+  ledger.reissueTask({
+    sessionId, reason: 'coupon contract v2: stacking rules changed',
+    packet: packet({
+      inputs: [{ id: 'contract:coupon', revision: `sha256:${'2'.repeat(64)}`, authority: 'product-architect' }],
+    }),
+  });
+
+  assert.equal(code(() => ledger.ackHandoff({ sessionId, handoffId: handoff.handoffId, actorRole: 'reviewer' })), 'HANDOFF_STALE');
+  // Refused, and nothing was recorded as received: a rejected ack that still
+  // logged an acknowledgement would let the next reader conclude work had started.
+  assert.equal(ledger.readEvents(sessionId).some((e) => e.kind === 'handoff-acked'), false);
+
+  // The remedy is a fresh handoff against current truth, which is then ackable.
+  const fresh = ledger.publishHandoff({ sessionId, draft: draft(), actorRole: 'fullstack' });
+  const { acked } = ledger.ackHandoff({ sessionId, handoffId: fresh.handoffId, actorRole: 'reviewer' });
+  assert.equal(acked.kind, 'handoff-acked');
+  assert.equal(acked.generation, 2, 'the acknowledgement pins which generation was received');
+
+  assert.equal(code(() => ledger.ackHandoff({ sessionId, handoffId: fresh.handoffId, actorRole: 'reviewer' })), 'HANDOFF_ACKED');
+});
+
+test('publishing against a snapshot the task has already moved past is refused', () => {
+  const { ledger, sessionId } = taskedSession();
+  const stale = ledger.readTask(sessionId, 'task:coupon').inputSnapshotDigest;
+  ledger.reissueTask({
+    sessionId, reason: 'contract moved while the work was in flight',
+    packet: packet({
+      inputs: [{ id: 'contract:coupon', revision: `sha256:${'3'.repeat(64)}`, authority: 'product-architect' }],
+    }),
+  });
+
+  // A sender that declares what it worked against gets checked against reality,
+  // rather than discovering the problem via the recipient halfway through.
+  assert.equal(code(() => ledger.publishHandoff({
+    sessionId, actorRole: 'fullstack', draft: draft({ inputSnapshotDigest: stale }),
+  })), 'HANDOFF_STALE');
+  assert.deepEqual(ledger.listHandoffs(sessionId), []);
+});
+
+test('editing a published handoff on disk is detected instead of obeyed', () => {
+  const { ledger, sessionId } = taskedSession();
+  const record = ledger.publishHandoff({ sessionId, draft: draft(), actorRole: 'fullstack' });
+  const file = ledger.handoffFile(sessionId, record.handoffId);
+
+  const tampered = JSON.parse(fs.readFileSync(file, 'utf8'));
+  tampered.handoff.nextAction = 'integrate';
+  fs.writeFileSync(file, JSON.stringify(tampered));
+
+  assert.equal(code(() => ledger.readHandoff(sessionId, record.handoffId)), 'HANDOFF_TAMPERED');
+  // And it cannot be laundered by acknowledging it, which is the read that matters.
+  assert.equal(code(() => ledger.ackHandoff({ sessionId, handoffId: record.handoffId, actorRole: 'reviewer' })), 'HANDOFF_TAMPERED');
+});
+
+/**
+ * `inbox` is what an Agent runs after losing its context, so it takes no session:
+ * an Agent that has forgotten everything cannot be asked where it was working.
+ *
+ * The `stale` flag is the point. Without it the recipient learns the inputs moved
+ * by having its acknowledgement refused, which is a worse place to find out — it
+ * has already decided to start.
+ */
+test('inbox shows what is actionable, addressed by role and narrowed by subject', () => {
+  const { ledger, sessionId } = taskedSession();
+  ledger.publishHandoff({ sessionId, draft: draft(), actorRole: 'fullstack' });
+  ledger.publishHandoff({ sessionId, actorRole: 'fullstack',
+    draft: draft({ to: { role: 'product-architect' }, nextAction: 'clarify',
+      summary: 'The contract does not say what an expired coupon on a saved cart should do.' }) });
+  ledger.publishHandoff({ sessionId, actorRole: 'fullstack',
+    draft: draft({ to: { role: 'reviewer', subject: 'agent:reviewer-07' }, summary: 'Only for reviewer-07.' }) });
+
+  const anyReviewer = ledger.inbox({ role: 'reviewer', subject: 'agent:reviewer-01' });
+  assert.deepEqual(anyReviewer.map((row) => row.handoffId), ['handoff:fullstack-to-reviewer-1'],
+    'a role-only handoff reaches whoever holds the role; a narrowed one does not');
+  assert.deepEqual(ledger.inbox({ role: 'reviewer', subject: 'agent:reviewer-07' }).map((r) => r.handoffId),
+    ['handoff:fullstack-to-reviewer-1', 'handoff:fullstack-to-reviewer-3']);
+  assert.deepEqual(ledger.inbox({ role: 'product-architect' }).map((r) => r.nextAction), ['clarify']);
+
+  const row = anyReviewer[0];
+  assert.equal(row.stale, false);
+  assert.equal(row.taskStatus, 'issued');
+  assert.equal(row.sessionId, sessionId);
+  assert.equal(row.from.role, 'fullstack');
+
+  // Acknowledging clears it from the queue: an inbox that still shows work you
+  // took is one you stop reading.
+  ledger.ackHandoff({ sessionId, handoffId: row.handoffId, actorRole: 'reviewer' });
+  assert.deepEqual(ledger.inbox({ role: 'reviewer', subject: 'agent:reviewer-01' }), []);
+
+  ledger.reissueTask({
+    sessionId, reason: 'contract v2',
+    packet: packet({
+      inputs: [{ id: 'contract:coupon', revision: `sha256:${'4'.repeat(64)}`, authority: 'product-architect' }],
+    }),
+  });
+  const stale = ledger.inbox({ role: 'reviewer', subject: 'agent:reviewer-07' });
+  assert.deepEqual(stale.map((r) => r.stale), [true], 'the recipient learns before acking, not by being refused');
+  assert.equal(stale[0].currentInputSnapshotDigest, ledger.readTask(sessionId, 'task:coupon').inputSnapshotDigest);
+});
+
+/**
+ * One unreadable session must not hide every other session's queue, because this
+ * is the recovery path: the Agent running `inbox` is the one least able to work
+ * out why it got an empty list.
+ */
+test('inbox reports a corrupt session as a row rather than throwing the queue away', () => {
+  const { ledger, sessionId } = taskedSession();
+  ledger.publishHandoff({ sessionId, draft: draft(), actorRole: 'fullstack' });
+
+  ledger.createSession({ sessionId: 'feature:broken', integrationTarget: 'main' });
+  fs.writeFileSync(ledger.sessionFile('feature:broken'), '{ not json');
+
+  const rows = ledger.inbox({ role: 'reviewer' });
+  assert.deepEqual(rows.map((r) => r.unreadable ?? r.handoffId),
+    ['LEDGER_CORRUPT', 'handoff:fullstack-to-reviewer-1']);
+});
+
+/**
+ * An ack is what empties a queue, so only the addressee may issue one.
+ *
+ * The damage from getting this wrong is not a misattributed event: the handoff
+ * leaves the addressee's inbox, so the state transfer is dropped and the recipient
+ * never learns there was anything waiting. That is precisely the failure the layer
+ * exists to prevent, arrived at through its own bookkeeping.
+ */
+test('only the addressee can acknowledge, so nobody else can empty their queue', () => {
+  const { ledger, sessionId } = taskedSession();
+  const open = ledger.publishHandoff({ sessionId, draft: draft(), actorRole: 'fullstack' });
+  const narrowed = ledger.publishHandoff({ sessionId, actorRole: 'fullstack',
+    draft: draft({ to: { role: 'reviewer', subject: 'agent:reviewer-07' } }) });
+
+  const ack = (handoffId, over = {}) => code(() => ledger.ackHandoff({ sessionId, handoffId, ...over }));
+  assert.equal(ack(open.handoffId, { actorRole: 'product-architect' }), 'HANDOFF_NOT_ADDRESSEE');
+  // Omitting the role does not skip the check; a safety property that switches
+  // itself off when a caller forgets an argument is not one you can rely on.
+  assert.equal(ack(open.handoffId), 'UNKNOWN_ROLE');
+  assert.equal(ledger.readEvents(sessionId).some((e) => e.kind === 'handoff-acked'), false);
+
+  // A handoff narrowed to one agent is not ackable by another holding the role.
+  assert.equal(ack(narrowed.handoffId, { actorRole: 'reviewer' }), 'HANDOFF_NOT_ADDRESSEE');
+  assert.equal(ack(narrowed.handoffId, { actorRole: 'reviewer', actor: 'agent:reviewer-07' }), null);
+
+  // Role-only addressing reaches whoever holds the role, whatever their agent id.
+  assert.equal(ack(open.handoffId, { actorRole: 'reviewer', actor: 'agent:reviewer-99' }), null);
+  assert.deepEqual(ledger.readEvents(sessionId)
+    .filter((e) => e.kind === 'handoff-acked').map((e) => [e.actor, e.actorRole]),
+  [['agent:reviewer-07', 'reviewer'], ['agent:reviewer-99', 'reviewer']]);
 });

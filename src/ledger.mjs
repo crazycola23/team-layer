@@ -28,6 +28,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { jsonDigest, inputSnapshotDigest, assertRevision } from './digest.mjs';
+import { isRole, roleIds } from './roles.mjs';
 import { assertId, slug, unslug } from './slug.mjs';
 
 export class LedgerError extends Error {
@@ -78,6 +79,34 @@ export const SESSION_TRANSITIONS = {
 };
 
 export const TASK_STATUSES = ['issued', 'in-progress', 'blocked', 'completed', 'cancelled'];
+
+/**
+ * What a handoff asks its recipient to do. Single authority for
+ * `schemas/handoff-action.schema.json`.
+ *
+ * An enum rather than a sentence because `teamctl inbox` is read by an Agent
+ * that has just lost its context: `ACTION implement` is a decision it can act
+ * on, whereas a paragraph describing what to do is something it has to
+ * interpret, and interpreting is the step that goes wrong. It also makes the
+ * queue countable, which is what the §12 metrics are derived from.
+ */
+export const HANDOFF_ACTIONS = ['implement', 'review', 'revise', 'clarify', 'validate', 'integrate'];
+
+/**
+ * Fields of a handoff the ledger assigns. A draft that sets one is refused
+ * rather than overridden: a publisher that believes it chose the id would go
+ * looking for a handoff nothing stored under that name.
+ */
+const HANDOFF_DERIVED = ['handoffId', 'seq', 'from', 'publishedAt', 'publishedBy', 'handoffDigest'];
+
+/**
+ * What a draft may set. Closed, matching the schema, because the failure mode of
+ * an open draft is silent: `artifcts` would be ignored and the handoff would
+ * publish claiming no artifacts exist, which is worse than a rejected draft.
+ * `$comment` is allowed so a template can explain itself.
+ */
+const HANDOFF_DRAFT_FIELDS = new Set(['$comment', 'sessionId', 'taskId', 'to', 'nextAction',
+  'summary', 'baseRevision', 'artifacts', 'evidence', 'unresolved', 'inputSnapshotDigest']);
 
 export const TASK_TRANSITIONS = {
   issued: ['in-progress', 'blocked', 'cancelled'],
@@ -354,6 +383,7 @@ export class Ledger {
         createdAt: at,
         updatedAt: at,
         eventSeq: 0,
+        handoffSeq: 0,
         ...(canonicalProvider ? { canonicalProvider } : {}),
         ...(notes ? { notes } : {}),
       };
@@ -602,5 +632,328 @@ export class Ledger {
       });
       return record;
     });
+  }
+
+  // -------------------------------------------------------------------- handoffs
+
+  handoffsDir(sessionId) {
+    return path.join(this.sessionDir(sessionId), 'handoffs');
+  }
+
+  handoffFile(sessionId, handoffId) {
+    return path.join(this.handoffsDir(sessionId), `${slug(handoffId, 'handoffId')}.json`);
+  }
+
+  /**
+   * Every handoff in the session, oldest first.
+   *
+   * Returns whole records rather than ids the way `listTasks` does, because the
+   * ordering lives inside the file: handoff ids end with the sequence number but
+   * begin with role names, so the directory sorts alphabetically by sender and
+   * not chronologically. Sorting correctly requires the read anyway.
+   */
+  listHandoffs(sessionId) {
+    const dir = this.handoffsDir(sessionId);
+    if (!fs.existsSync(dir)) return [];
+    return fs.readdirSync(dir)
+      .filter((name) => name.endsWith('.json'))
+      .map((name) => this.readHandoff(sessionId, unslug(name.slice(0, -'.json'.length))))
+      .sort((a, b) => a.seq - b.seq);
+  }
+
+  /** Read a handoff, proving the statement has not been edited since publication. */
+  readHandoff(sessionId, handoffId) {
+    assertId(sessionId, 'sessionId');
+    assertId(handoffId, 'handoffId');
+    const file = this.handoffFile(sessionId, handoffId);
+    const record = readJson(file, `handoff ${handoffId}`);
+    const actual = jsonDigest(record.handoff);
+    if (actual !== record.handoffDigest) {
+      throw new LedgerError(
+        'HANDOFF_TAMPERED',
+        `handoff ${handoffId} does not match its recorded digest; it was edited after publication. ` +
+          'Publish a new handoff instead of trusting this file.',
+        { file, recorded: record.handoffDigest, actual },
+      );
+    }
+    return record;
+  }
+
+  /**
+   * Publish a state transfer from `actorRole` to the role named in the draft.
+   *
+   * The caller supplies content; the ledger supplies identity. `handoffId`, `seq`,
+   * `from`, `inputSnapshotDigest` and the timestamps are all derived, and a draft
+   * that sets one of them is refused rather than silently overridden — a publisher
+   * that believes it chose the id would go looking for a handoff that does not
+   * exist under that name.
+   *
+   * `inputSnapshotDigest` is copied from the task rather than accepted from the
+   * draft, so a handoff cannot claim to have been produced against a snapshot that
+   * was never current. A draft may still *declare* one, and then it is checked:
+   * declaring a snapshot the task has moved past means the sender did the work
+   * against superseded truth, which is refused here rather than discovered by the
+   * recipient halfway through acting on it.
+   */
+  publishHandoff({ sessionId, draft, actor = this.actor, actorRole }) {
+    assertId(sessionId, 'sessionId');
+    if (!draft || typeof draft !== 'object' || Array.isArray(draft)) {
+      throw new LedgerError('MALFORMED_HANDOFF', 'a handoff draft must be an object');
+    }
+    for (const field of HANDOFF_DERIVED) {
+      if (draft[field] !== undefined) {
+        throw new LedgerError('MALFORMED_HANDOFF',
+          `${field} is assigned by the ledger; remove it from the draft`);
+      }
+    }
+    for (const field of Object.keys(draft)) {
+      if (!HANDOFF_DRAFT_FIELDS.has(field)) {
+        throw new LedgerError('MALFORMED_HANDOFF',
+          `${field} is not a handoff field; a misspelled field would publish silently missing content`);
+      }
+    }
+    const taskId = draft.taskId;
+    assertId(taskId, 'draft.taskId');    if (draft.sessionId !== undefined && draft.sessionId !== sessionId) {
+      throw new LedgerError('SESSION_MISMATCH',
+        `draft.sessionId ${JSON.stringify(draft.sessionId)} is not ${sessionId}`);
+    }
+    // Role errors are raised as LedgerError rather than passed through from the
+    // role registry, because the CLI turns a ledger refusal into an exit code and
+    // a second error type would fall through that to an unhandled crash.
+    if (!isRole(actorRole)) {
+      throw new LedgerError('UNKNOWN_ROLE',
+        `the publishing role ${JSON.stringify(actorRole)} is not a known role; expected ${roleIds().join(', ')}`);
+    }
+    const toRole = draft.to?.role;
+    if (!isRole(toRole)) {
+      throw new LedgerError('UNKNOWN_ROLE',
+        `to.role ${JSON.stringify(toRole)} is not a known role; expected ${roleIds().join(', ')}`);
+    }
+    if (draft.to.subject !== undefined) assertId(draft.to.subject, 'to.subject');
+    // A distinct code from MALFORMED_HANDOFF, mirroring UNKNOWN_ROLE: "that word is
+    // not an action" is a fixable typo, whereas a malformed draft is a shape error,
+    // and a caller that has to grep the message to tell them apart will not.
+    if (!HANDOFF_ACTIONS.includes(draft.nextAction)) {
+      throw new LedgerError('UNKNOWN_ACTION',
+        `nextAction must be one of ${HANDOFF_ACTIONS.join(', ')}, got ${JSON.stringify(draft.nextAction)}`);
+    }
+    if (typeof draft.summary !== 'string' || draft.summary.trim() === '') {
+      throw new LedgerError('MALFORMED_HANDOFF', 'a handoff requires a non-empty summary');
+    }
+    if (draft.baseRevision !== undefined) assertRevision(draft.baseRevision, 'baseRevision');
+
+    return this.withLock(sessionId, () => {
+      const session = this.readSession(sessionId);
+      const task = this.readTask(sessionId, taskId);
+      if (task.state.status === 'cancelled') {
+        throw new LedgerError('ILLEGAL_TRANSITION',
+          `task ${taskId} is cancelled; there is no state left to hand off`);
+      }
+      const snapshot = task.inputSnapshotDigest;
+      if (draft.inputSnapshotDigest !== undefined && draft.inputSnapshotDigest !== snapshot) {
+        throw new LedgerError('HANDOFF_STALE',
+          `the draft was produced against input snapshot ${draft.inputSnapshotDigest}, but task ${taskId} ` +
+            `is now at ${snapshot}. Re-read the task and redo the work against current truth.`,
+          { declared: draft.inputSnapshotDigest, current: snapshot, taskId });
+      }
+      const seq = session.handoffSeq + 1;
+      const handoffId = `handoff:${actorRole}-to-${toRole}-${seq}`;
+      const handoff = {
+        sessionId,
+        taskId,
+        from: { subject: actor, role: actorRole },
+        to: { role: toRole, ...(draft.to.subject ? { subject: draft.to.subject } : {}) },
+        inputSnapshotDigest: snapshot,
+        ...(draft.baseRevision ? { baseRevision: draft.baseRevision } : {}),
+        artifacts: draft.artifacts ?? [],
+        evidence: draft.evidence ?? [],
+        unresolved: draft.unresolved ?? [],
+        nextAction: draft.nextAction,
+        summary: draft.summary,
+      };
+      const file = this.handoffFile(sessionId, handoffId);
+      if (fs.existsSync(file)) {
+        throw new LedgerError('HANDOFF_EXISTS',
+          `handoff ${handoffId} already exists at ${file}; session.handoffSeq disagrees with the directory`);
+      }
+      const at = nowIso();
+      const handoffDigest = jsonDigest(handoff);
+      // Re-sending state that was already transferred is legal — it is how you
+      // nudge a recipient who has not acknowledged — but it is not new
+      // information, and the recipient deserves to be told which it is. The
+      // statement is substance only, so an identical digest means identical
+      // state; that is the whole reason handoffId and publishedAt sit outside it.
+      const duplicateOf = this.listHandoffs(sessionId)
+        .find((existing) => existing.handoffDigest === handoffDigest)?.handoffId ?? null;
+      const record = {
+        schemaVersion: 1,
+        seq,
+        handoffId,
+        handoff,
+        handoffDigest,
+        publishedAt: at,
+        publishedBy: actor,
+      };
+      fs.mkdirSync(this.handoffsDir(sessionId), { recursive: true });
+      writeJsonAtomic(file, record);
+      session.handoffSeq = seq;
+      this.#commit(session, {
+        kind: 'handoff-published',
+        at,
+        actor,
+        handoffId,
+        taskId,
+        to: toRole,
+        ...(draft.to.subject ? { toSubject: draft.to.subject } : {}),
+        nextAction: handoff.nextAction,
+        inputSnapshotDigest: snapshot,
+        handoffDigest: record.handoffDigest,
+        ...(duplicateOf ? { duplicateOf } : {}),
+      });
+      return record;
+    });
+  }
+
+  /**
+   * Acknowledge a handoff: the recipient has read it and is taking the action.
+   *
+   * Refused when the task has moved past the snapshot the handoff was published
+   * against. This is the team-layer enforcement of plan §2.3 `stale-input`, and it
+   * has to fail closed: the whole point of acknowledging is that the recipient is
+   * about to start work, and the most expensive moment to discover the inputs
+   * changed is after that work exists. There is deliberately no override — the
+   * remedy is a fresh handoff against current truth, which is cheap, and an
+   * escape hatch here would become the default path.
+   *
+   * The acknowledgement is an event and not a field, so the published statement
+   * stays immutable and keeps its digest.
+   *
+   * Only the addressee may acknowledge. See below: an ack is what empties a queue,
+   * so allowing anyone to issue one turns "the inbox is clear" into a claim nobody
+   * checked.
+   */
+  ackHandoff({ sessionId, handoffId, actor = this.actor, actorRole }) {
+    assertId(sessionId, 'sessionId');
+    assertId(handoffId, 'handoffId');
+    // Required, not defaulted to "unchecked". A caller that omitted the role would
+    // silently lose the addressee check below, and a safety property that switches
+    // itself off when a caller forgets an argument is not one you can rely on.
+    if (!isRole(actorRole)) {
+      throw new LedgerError('UNKNOWN_ROLE',
+        `acknowledging requires the role doing it; ${JSON.stringify(actorRole)} is not one of ${roleIds().join(', ')}`);
+    }
+    return this.withLock(sessionId, () => {
+      const session = this.readSession(sessionId);
+      const record = this.readHandoff(sessionId, handoffId);
+      const already = this.readEvents(sessionId)
+        .find((event) => event.kind === 'handoff-acked' && event.handoffId === handoffId);
+      if (already) {
+        throw new LedgerError('HANDOFF_ACKED',
+          `handoff ${handoffId} was already acknowledged by ${already.actor} at ${already.at}`,
+          { actor: already.actor, at: already.at });
+      }
+      // Only the addressee may acknowledge, because acknowledging is what removes
+      // the handoff from a queue. A non-addressee acking it does not merely record
+      // the wrong name: it empties the recipient's inbox, so the state transfer is
+      // silently dropped and the recipient never learns there was work waiting —
+      // exactly the failure this layer exists to make impossible.
+      const { to } = record.handoff;
+      const addressed = to.subject ? to.subject === actor : to.role === actorRole;
+      if (!addressed) {
+        throw new LedgerError('HANDOFF_NOT_ADDRESSEE',
+          `handoff ${handoffId} is addressed to ${to.subject ?? to.role}, not to ${actor} as ${actorRole}. ` +
+            'Acknowledging it would clear it from the addressee\'s inbox without them ever seeing it.',
+          { to, actor, actorRole });
+      }
+      const { taskId, inputSnapshotDigest: published } = record.handoff;
+      const task = this.readTask(sessionId, taskId);
+      if (task.inputSnapshotDigest !== published) {
+        throw new LedgerError('HANDOFF_STALE',
+          `handoff ${handoffId} was published against input snapshot ${published}, but task ${taskId} is ` +
+            `now at ${task.inputSnapshotDigest}. Ask for a fresh handoff rather than starting work ` +
+            'against superseded inputs.',
+          { published, current: task.inputSnapshotDigest, taskId, generation: task.state.generation });
+      }
+      const acked = this.#commit(session, {
+        kind: 'handoff-acked',
+        actor,
+        actorRole,
+        handoffId,
+        taskId,
+        generation: task.state.generation,
+        inputSnapshotDigest: published,
+        nextAction: record.handoff.nextAction,
+      });
+      return { acked, handoff: record };
+    });
+  }
+
+  /**
+   * Actionable handoffs addressed to a recipient, across every session.
+   *
+   * Takes no session argument because this is what an Agent runs after losing its
+   * context, and it cannot be asked which session it was in. Addressing follows
+   * the artifact: a handoff narrowed to one subject reaches only that subject,
+   * while a role-only handoff reaches whoever currently holds the role.
+   *
+   * Each row carries `stale`, so the recipient learns that the inputs moved
+   * *before* acknowledging rather than by having the acknowledgement refused. A
+   * session or task that cannot be read is reported as a row rather than thrown,
+   * because this is the recovery path: one corrupt session must not be able to
+   * hide every other session's queue.
+   */
+  inbox({ role = null, subject = null } = {}) {
+    if (role === null && subject === null) {
+      throw new LedgerError('MALFORMED_ID', 'inbox needs a role or a subject to address');
+    }
+    const rows = [];
+    for (const sessionId of this.listSessions()) {
+      let session;
+      let events;
+      let handoffs;
+      try {
+        session = this.readSession(sessionId);
+        events = this.readEvents(sessionId, { expectSeq: session.eventSeq });
+        handoffs = this.listHandoffs(sessionId);
+      } catch (error) {
+        rows.push({ sessionId, unreadable: error.code ?? 'UNREADABLE', message: error.message });
+        continue;
+      }
+      const acked = new Set(events
+        .filter((event) => event.kind === 'handoff-acked')
+        .map((event) => event.handoffId));
+      for (const record of handoffs) {
+        const h = record.handoff;
+        if (acked.has(record.handoffId)) continue;
+        const mine = h.to.subject ? h.to.subject === subject : h.to.role === role;
+        if (!mine) continue;
+        const row = {
+          sessionId,
+          sessionStatus: session.status,
+          handoffId: record.handoffId,
+          seq: record.seq,
+          from: h.from,
+          taskId: h.taskId,
+          nextAction: h.nextAction,
+          summary: h.summary,
+          inputSnapshotDigest: h.inputSnapshotDigest,
+          unresolved: h.unresolved.length,
+          publishedAt: record.publishedAt,
+        };
+        try {
+          const task = this.readTask(sessionId, h.taskId);
+          row.stale = task.inputSnapshotDigest !== h.inputSnapshotDigest;
+          row.taskStatus = task.state.status;
+          if (row.stale) row.currentInputSnapshotDigest = task.inputSnapshotDigest;
+        } catch (error) {
+          // Unknown beats false: reporting `stale: false` for a task that cannot
+          // be read would be an assertion nothing checked.
+          row.stale = null;
+          row.taskUnreadable = error.code ?? 'UNREADABLE';
+        }
+        rows.push(row);
+      }
+    }
+    return rows;
   }
 }

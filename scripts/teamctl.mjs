@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
 import { roleIds, isRole, roleFile, roleVersion } from '../src/roles.mjs';
-import { Ledger, LedgerError, SESSION_STATUSES, TASK_STATUSES } from '../src/ledger.mjs';
+import { Ledger, LedgerError, SESSION_STATUSES, TASK_STATUSES, HANDOFF_ACTIONS } from '../src/ledger.mjs';
 import { SlugError } from '../src/slug.mjs';
 import { DigestError } from '../src/digest.mjs';
 
@@ -579,6 +579,86 @@ function status(args) {
     });
   });
 }
+
+/**
+ * The agent bound to this worktree as `{ agentId, role }`, or null if there is none.
+ *
+ * Kept separate from `actorFor` because a handoff needs the *role* as well as the
+ * id: who published a state transfer and in what capacity are different facts, and
+ * the role is what the recipient's inbox filters on.
+ *
+ * The role is read through the binding rather than from it. `.agent-team-binding.json`
+ * deliberately does not carry one — identity.json is the single authority, and a
+ * second copy here would be the copy that goes stale after `setup --role` moves an
+ * agent, leaving handoffs addressed in a capacity the agent no longer holds.
+ */
+function bindingFor(repo) {
+  const bindingPath = path.join(repo.root, '.agent-team-binding.json');
+  if (!fs.existsSync(bindingPath)) return null;
+  const binding = readJson(bindingPath);
+  const identity = readJson(binding.identityPath);
+  return { ...binding, role: identity.role };
+}
+
+/**
+ * The role this worktree acts in.
+ *
+ * Same precedence as `actorFor`: the binding wins, and `--role` is the one-off for
+ * a worktree that has none. The binding must win rather than merely be a default,
+ * because both callers use this as an authorisation input — a publisher that could
+ * assert any role would make `to.role` addressing meaningless, and an acknowledger
+ * that could would be able to clear another role's queue.
+ */
+function roleFor(binding, args) {
+  if (binding?.role) return binding.role;
+  if (typeof args.role === 'string' && args.role !== '') return args.role;
+  die('no agent binding found in this worktree; run `teamctl setup` first, or pass --role for a one-off');
+}
+
+function handoffCommand(args) {
+  const sub = args._[1];
+  const { repo, ledger } = ledgerFor(args);
+  const binding = bindingFor(repo);
+  runLedger(() => {
+    if (sub === 'publish') {
+      const draft = readJson(path.resolve(requireFlag(args, 'handoff')));
+      const sessionId = typeof args.session === 'string' ? args.session : draft.sessionId;
+      if (!sessionId) die('--session is required when the draft does not name one');
+      emit(ledger.publishHandoff({ sessionId, draft, actorRole: roleFor(binding, args) }));
+    } else if (sub === 'ack') {
+      emit(ledger.ackHandoff({
+        sessionId: requireFlag(args, 'session'),
+        handoffId: requireFlag(args, 'handoff'),
+        actorRole: roleFor(binding, args),
+      }));
+    } else if (sub === 'show') {
+      const sessionId = requireFlag(args, 'session');
+      if (typeof args.handoff === 'string') {
+        emit(ledger.readHandoff(sessionId, args.handoff));
+        return;
+      }
+      emit(ledger.listHandoffs(sessionId));
+    } else {
+      die(`unknown handoff subcommand ${sub ?? '(none)'}`);
+    }
+  });
+}
+
+/**
+ * The queue: handoffs addressed to this worktree's agent that it has not acked.
+ *
+ * Takes no arguments for the same reason `status` does not — an Agent that has
+ * lost its context cannot be asked which session it was working in.
+ */
+function inbox(args) {
+  const { repo, ledger } = ledgerFor(args);
+  const binding = bindingFor(repo);
+  const role = roleFor(binding, args);
+  runLedger(() => {
+    emit(ledger.inbox({ role, subject: binding ? `agent:${binding.agentId}` : null }));
+  });
+}
+
 function usage() {
   console.log(`Persistent Agent Team helper\n\n` +
     `Identity:\n` +
@@ -596,6 +676,12 @@ function usage() {
     `  task reissue       --packet <file.json> --reason <why> [--expect-generation N]\n` +
     `  task show          --session <id> --task <id>\n` +
     `  task set-status    --session <id> --task <id> --status <status> [--expect-revision N] [--note ...]\n\n` +
+    `Handoffs (state transfer between roles, not a transcript):\n` +
+    `  inbox                         What is waiting for me? Unacked handoffs addressed to this agent\n` +
+    `  handoff publish    --handoff <draft.json> [--session <id>]\n` +
+    `  handoff ack        --session <id> --handoff <handoff-id>\n` +
+    `  handoff show       --session <id> [--handoff <handoff-id>]\n\n` +
+    `  next action:    ${HANDOFF_ACTIONS.join(', ')}\n` +
     `  session status: ${SESSION_STATUSES.join(', ')}\n` +
     `  task status:    ${TASK_STATUSES.join(', ')}\n\n` +
     `Exit codes:\n` +
@@ -616,4 +702,6 @@ else if (command === 'show') show(args);
 else if (command === 'status') status(args);
 else if (command === 'session') sessionCommand(args);
 else if (command === 'task') taskCommand(args);
+else if (command === 'handoff') handoffCommand(args);
+else if (command === 'inbox') inbox(args);
 else die(`unknown command ${command}`);

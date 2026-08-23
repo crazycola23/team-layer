@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/crazycola23/team-layer/schemas/handoff-action.schema.json",
+  "title": "Handoff action",
+  "description": "The single thing a handoff asks its recipient to do (plan §4). Closed on purpose: `teamctl inbox` has to be actionable at a glance to an Agent that just lost its context, and free text is something to interpret rather than act on.",
+  "x-generated-from": "src/ledger.mjs HANDOFF_ACTIONS",
+  "type": "string",
+  "enum": [
+    "implement",
+    "review",
+    "revise",
+    "clarify",
+    "validate",
+    "integrate"
+  ]
+}

@@ -13,7 +13,8 @@
     "integrationTarget",
     "createdAt",
     "updatedAt",
-    "eventSeq"
+    "eventSeq",
+    "handoffSeq"
   ],
   "properties": {
     "schemaVersion": {
@@ -42,6 +43,11 @@
     },
     "eventSeq": {
       "description": "Count of events appended to events.jsonl. Written before the event itself, so a crash between the two reads as a truncated log instead of an event nothing accounts for.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "handoffSeq": {
+      "description": "Count of handoffs published in this session. Kept on the session rather than derived from the handoffs directory so that a lost file cannot cause the next handoff to reuse an id that events.jsonl already records.",
       "type": "integer",
       "minimum": 0
     },

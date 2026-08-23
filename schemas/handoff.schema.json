@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/crazycola23/team-layer/schemas/handoff.schema.json",
+  "title": "Handoff",
+  "description": "One state transfer between two roles (plan §4). A handoff is state, not transcript: it names the input snapshot the work was done against, what now exists, what is still open, and the single next action. Prose fields are length-capped deliberately — a field that can hold a conversation log will be used to hold one, and the recipient then has to reconstruct the state anyway, which is the failure this artifact exists to prevent.\n\nThe two halves mirror task-record.schema.json. `handoff` is the statement and is content-addressed by `handoffDigest`; `seq`, `publishedAt` and `publishedBy` are circumstance and live outside it. Keeping them apart is what makes republishing identical state detectable instead of looking like new information.\n\nHandoff files are written once and never edited. Acknowledgement is an event in events.jsonl, not a field here: whether a statement was received is a different fact from what the statement says, and mutating the artifact to record receipt would break its digest.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "seq", "handoffId", "handoff", "handoffDigest", "publishedAt", "publishedBy"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "handoffId": {
+      "description": "Assigned by the ledger as handoff:<from-role>-to-<to-role>-<seq>. Kept outside the digested half because it embeds the sequence number: inside, two byte-identical statements would hash differently and re-sending the same state would be indistinguishable from new state.",
+      "$ref": "id.schema.json"
+    },
+    "seq": {
+      "description": "Position in this session's handoff order, assigned by the ledger under the session lock. Filenames are keyed by handoffId and do not sort chronologically, so this is the only ordering available.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "handoffDigest": { "$ref": "digest.schema.json" },
+    "publishedAt": { "$ref": "timestamp.schema.json" },
+    "publishedBy": { "$ref": "id.schema.json" },
+    "handoff": {
+      "description": "The statement itself: substance only, so that its digest identifies the state being transferred and nothing about the act of transferring it.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sessionId", "taskId", "from", "to", "inputSnapshotDigest", "nextAction", "summary", "artifacts", "evidence", "unresolved"],
+      "properties": {
+        "sessionId": { "$ref": "id.schema.json" },
+        "taskId": {
+          "description": "The task this transfers state about. Required: a handoff with no task is not actionable, and the task is also the only thing that can say whether the declared input snapshot is still current.",
+          "$ref": "id.schema.json"
+        },
+        "from": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["subject", "role"],
+          "properties": {
+            "subject": { "$ref": "id.schema.json" },
+            "role": { "$ref": "role.schema.json" }
+          }
+        },
+        "to": {
+          "description": "Addressed by role, optionally narrowed to one agent. Role-only is the normal case: it survives the recipient being restarted under a different agent id, which is exactly the situation this layer exists for.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["role"],
+          "properties": {
+            "role": { "$ref": "role.schema.json" },
+            "subject": { "$ref": "id.schema.json" }
+          }
+        },
+        "inputSnapshotDigest": {
+          "description": "The task's input snapshot at publication. Copied from the task rather than asserted by the publisher, so it cannot describe a snapshot the work was not actually done against. Acknowledgement is refused when this no longer matches the task.",
+          "$ref": "digest.schema.json"
+        },
+        "baseRevision": { "$ref": "git-revision.schema.json" },
+        "artifacts": {
+          "description": "What now exists, addressed by revision. This is the recipient's read list; it replaces \"look at my branch and work it out\".",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type", "id", "revision"],
+            "properties": {
+              "type": { "type": "string", "enum": ["contract", "spec", "decision", "code", "test", "doc"] },
+              "id": { "$ref": "id.schema.json" },
+              "revision": { "$ref": "revision.schema.json" }
+            }
+          }
+        },
+        "evidence": {
+          "description": "Claims that were checked, with what checking them produced. A claim with no result is an intention, so both are required.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "detail", "result"],
+            "properties": {
+              "kind": { "type": "string", "enum": ["commit", "validation", "canonical-revision", "manual"] },
+              "detail": { "type": "string", "minLength": 1, "maxLength": 300 },
+              "result": { "type": "string", "minLength": 1, "maxLength": 300 }
+            }
+          }
+        },
+        "unresolved": {
+          "description": "Open questions and blockers the recipient inherits. Empty is a meaningful statement — it asserts nothing is outstanding — so the field is required rather than optional.",
+          "type": "array",
+          "items": { "type": "string", "minLength": 1, "maxLength": 300 }
+        },
+        "nextAction": { "$ref": "handoff-action.schema.json" },
+        "summary": {
+          "description": "What changed or was decided, in the sender's words. Capped because this is the field a transcript dump would land in.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 600
+        }
+      }
+    }
+  }
+}

@@ -13,7 +13,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { inputSnapshotDigest, DigestError, REVISION_PATTERN, DIGEST_PATTERN, GIT_REVISION_PATTERN } from '../src/digest.mjs';
-import { SESSION_STATUSES, TASK_STATUSES } from '../src/ledger.mjs';
+import { SESSION_STATUSES, TASK_STATUSES, HANDOFF_ACTIONS } from '../src/ledger.mjs';
 import { ID_PATTERN, MAX_ID_LENGTH } from '../src/slug.mjs';
 import { SKILL_ROOT, roleIds, registryDigest } from '../src/roles.mjs';
 
@@ -117,6 +117,16 @@ emit('schemas/task-status.schema.json', {
   'x-generated-from': 'src/ledger.mjs TASK_STATUSES',
   type: 'string',
   enum: TASK_STATUSES,
+});
+
+emit('schemas/handoff-action.schema.json', {
+  $schema: 'https://json-schema.org/draft/2020-12/schema',
+  $id: 'https://github.com/crazycola23/team-layer/schemas/handoff-action.schema.json',
+  title: 'Handoff action',
+  description: 'The single thing a handoff asks its recipient to do (plan §4). Closed on purpose: `teamctl inbox` has to be actionable at a glance to an Agent that just lost its context, and free text is something to interpret rather than act on.',
+  'x-generated-from': 'src/ledger.mjs HANDOFF_ACTIONS',
+  type: 'string',
+  enum: HANDOFF_ACTIONS,
 });
 
 // -------------------------------------------------- input snapshot test vectors

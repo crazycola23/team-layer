@@ -1,0 +1,20 @@
+{
+  "$comment": "A handoff draft: what you write, before `teamctl handoff publish --handoff <this>` turns it into a record. The ledger fills in handoffId, seq, from, inputSnapshotDigest, publishedAt, publishedBy and handoffDigest; setting any of them here is refused rather than overridden. See schemas/handoff.schema.json for the stored shape and templates/handoff.md for the same content as prose.",
+  "sessionId": "feature:coupon",
+  "taskId": "task:coupon-api",
+  "to": { "role": "reviewer" },
+  "nextAction": "review",
+  "summary": "Coupon discount is applied once per order, enforced in the domain layer rather than at the API edge so batch imports go through the same rule. Stacking with promo codes is rejected with 409.",
+  "baseRevision": "git:abc1234",
+  "artifacts": [
+    { "type": "code", "id": "module:coupon-domain", "revision": "git:def5678" },
+    { "type": "test", "id": "suite:coupon-stacking", "revision": "git:def5678" }
+  ],
+  "evidence": [
+    { "kind": "validation", "detail": "npm test", "result": "142 pass, 0 fail" },
+    { "kind": "commit", "detail": "git:def5678", "result": "reject stacking, add domain-level idempotency" }
+  ],
+  "unresolved": [
+    "Whether an expired coupon on a saved cart should fail the checkout or silently drop; the contract does not say."
+  ]
+}
