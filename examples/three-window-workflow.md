@@ -81,6 +81,7 @@ Reviewer may pre-review the brief for contradictions/untestable criteria.
 Product issues the task packet. It is a file, not a message, and the packet is frozen when issued —
 which is what makes staleness detectable later:
 
+<!-- validate: task-packet.schema.json -->
 ```json
 {
   "schemaVersion": 2,
@@ -94,7 +95,7 @@ which is what makes staleness detectable later:
   "inputs": [
     {
       "id": "contract:checkout-coupon-api",
-      "revision": "sha256:abc...",
+      "revision": "sha256:3f1a0c8e5b2d47a9061e8f4c7b3d5a2e9c8f014b6d7a3e5c9f2b8d604a1e7c35",
       "authority": "product-architect"
     }
   ],
@@ -145,8 +146,10 @@ node scripts/teamctl.mjs handoff ack --session feature:coupon --handoff <handoff
 
 Reviewer checks the candidate against acceptance/contracts and produces findings such as:
 
+<!-- validate: finding.schema.json -->
 ```json
 {
+  "schemaVersion": 1,
   "findingId": "FIND-001",
   "severity": "major",
   "status": "open",

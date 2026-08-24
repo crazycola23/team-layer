@@ -41,28 +41,29 @@ Unrelated reversible discovery/scaffolding may proceed.
 
 Fullstack receives a task packet, not Product's full conversation.
 
-Recommended team-layer task shape:
+The packet shape lives in [templates/task-packet.json](../templates/task-packet.json), validated
+against [schemas/task-packet.schema.json](../schemas/task-packet.schema.json). Copy the template
+and edit it; this document deliberately does not restate it.
 
-```json
-{
-  "schemaVersion": 1,
-  "taskId": "task:coupon-fullstack",
-  "sessionId": "feature:coupon",
-  "subject": "agent:fullstack-01",
-  "role": "fullstack",
-  "baseRevision": "git:abc1234",
-  "readSet": ["apps/**", "packages/contracts/**"],
-  "writeSet": ["apps/web/**", "apps/api/**", "tests/**"],
-  "inputs": [
-    {
-      "id": "contract:coupon-api",
-      "revision": "sha256:...",
-      "authority": "spec-suite"
-    }
-  ],
-  "acceptance": ["AC-1", "AC-2", "AC-3"]
-}
-```
+That is not a stylistic preference. A second copy of the packet in prose is a copy that drifts:
+this section carried `schemaVersion: 1` and no `validationPlan` for as long as the real packet had
+been at 2, so an Agent following the documentation would have written a packet the ledger refuses.
+Prose can explain a field; it cannot be the field's definition and stay true.
+
+What the packet carries, and why each part is there:
+
+| field | what it fixes |
+| --- | --- |
+| `taskId`, `sessionId`, `subject`, `role` | who is being asked, in which session, under which role contract |
+| `baseRevision` | the tree the work starts from, so a candidate can be checked for descent from it |
+| `readSet`, `writeSet` | what may be consulted and what may be touched — the scope spec-suite enforces |
+| `inputs` | the semantic dependencies, each pinned to a revision, so "the contract moved" is detectable |
+| `acceptance` | the standard the work is judged against, named rather than implied |
+| `validationPlan` | the checks that must pass, and at which gate — [review.md](review.md) lists the reasons a gate can withhold a pass |
+
+Everything above is frozen on issue: `teamctl task issue` seals it as `frozenDigest`, and the only
+way to change any of it is `teamctl task reissue`, which mints a new generation and leaves every
+handoff, review and validation result produced under the old one no longer applicable.
 
 Fullstack implements, verifies, self-reviews, and commits candidate state.
 

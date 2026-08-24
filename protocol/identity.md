@@ -17,6 +17,7 @@ where `AGENT_TEAM_HOME` defaults to `~/.agent-team`.
 
 Identity contains stable semantics only:
 
+<!-- validate: identity.schema.json -->
 ```json
 {
   "schemaVersion": 1,
@@ -24,9 +25,15 @@ Identity contains stable semantics only:
   "role": "fullstack",
   "roleVersion": "1.0.0",
   "skill": "persistent-agent-team",
-  "skillVersion": "0.1.0"
+  "skillVersion": "0.1.0",
+  "createdAt": "2026-02-14T09:12:03.117Z",
+  "updatedAt": "2026-02-14T09:12:03.117Z"
 }
 ```
+
+`createdAt` and `updatedAt` are part of the stable object rather than session state because they
+describe the identity itself: when this Agent came into existence, and when its role or skill
+version last changed. Neither moves when a conversation ends.
 
 Do not encode model, provider, harness, current worktree, branch, or current task into the
 stable identity object. Those are bindings/session state.

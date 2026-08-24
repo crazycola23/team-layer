@@ -11,6 +11,7 @@ import {
 import { NEXT_ACTIONS, RECONCILE_STATUSES } from '../src/reconcile.mjs';
 import { METRIC_SOURCES, DERIVED_METRICS, UNAVAILABLE_METRICS } from '../src/metrics.mjs';
 import { VALIDATION_KINDS, RUNNABLE_KINDS } from '../src/validation.mjs';
+import { loadSchema, validate } from '../src/schema.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const failures = [];
@@ -286,6 +287,92 @@ ok(findingSchema.required.includes('evidence') && findingSchema.required.include
 JSON.parse(text('templates/task-packet.json'));
 JSON.parse(text('templates/finding.json'));
 JSON.parse(text('templates/review-decision.json'));
+
+/**
+ * Documented examples are validated against the schemas, not proofread against them.
+ *
+ * The drift this ends had already happened: `protocol/collaboration.md` showed a
+ * `schemaVersion: 1` packet with no `validationPlan` for as long as the real packet had
+ * been at 2, and an Agent that followed the documentation would have written a file the
+ * ledger refuses. Nothing caught it because nothing was looking — a JSON block in Markdown
+ * is prose to every tool in the repo.
+ *
+ * The rule that keeps it from recurring is not "check the examples" but "have one copy".
+ * The packet shape now lives in `templates/task-packet.json` and the document points at it.
+ * Where an example genuinely has to be inline — because the point being made is about the
+ * specific content, not the shape — it carries `<!-- validate: <schema> -->` and is checked
+ * here against exactly the schema the ledger uses.
+ *
+ * Marking is opt-in, which means the honest failure mode is an unmarked example rather than
+ * a wrong one, so two guards sit under it: the sweep must find something, and it must find
+ * the examples we know exist. Otherwise deleting a marker would silently delete its coverage
+ * and the suite would go on reporting PASS.
+ */
+const MARKED_EXAMPLE = /<!-- validate: ([a-z0-9.-]+\.schema\.json) -->\s*\n```json\n([\s\S]*?)\n```/g;
+const markdownFiles = (dir) => fs.readdirSync(path.join(ROOT, dir), { withFileTypes: true })
+  .flatMap((entry) => {
+    if (entry.name.startsWith('.') || entry.name === 'node_modules') return [];
+    const rel = dir === '.' ? entry.name : `${dir}/${entry.name}`;
+    if (entry.isDirectory()) return markdownFiles(rel);
+    return entry.name.endsWith('.md') ? [rel] : [];
+  });
+
+const examplesFound = [];
+for (const doc of markdownFiles('.')) {
+  const body = text(doc);
+  // A marker whose fence did not parse into the regex is a broken marker, and a broken
+  // marker silently validates nothing. Count them separately so it fails loudly instead.
+  const markers = (body.match(/<!-- validate: /g) ?? []).length;
+  const matches = [...body.matchAll(MARKED_EXAMPLE)];
+  ok(markers === matches.length,
+    `${doc} has ${markers} validate markers but ${matches.length} are followed by a json fence`);
+  for (const [, schemaFile, json] of matches) {
+    examplesFound.push(`${doc} -> ${schemaFile}`);
+    const schemaPath = path.join(ROOT, 'schemas', schemaFile);
+    if (!fs.existsSync(schemaPath)) {
+      ok(false, `${doc} claims to follow schemas/${schemaFile}, which does not exist`);
+      continue;
+    }
+    let value;
+    try {
+      value = JSON.parse(json);
+    } catch (error) {
+      ok(false, `${doc}: the example marked ${schemaFile} is not valid JSON: ${error.message}`);
+      continue;
+    }
+    for (const error of validate(loadSchema(schemaPath), value)) {
+      ok(false, `${doc}: the example marked ${schemaFile} is not valid: ${error.path} ${error.message}`);
+    }
+  }
+}
+
+// Both guards are here so that removing coverage fails rather than passing quietly: the first
+// catches the marker convention being abandoned wholesale, the second catches one example
+// losing its marker while the others keep the sweep looking productive.
+ok(examplesFound.length > 0,
+  'no marked doc examples were found at all, so this whole section passed by checking nothing');
+for (const expected of [
+  'examples/three-window-workflow.md -> task-packet.schema.json',
+  'examples/three-window-workflow.md -> finding.schema.json',
+  'protocol/identity.md -> identity.schema.json',
+]) {
+  ok(examplesFound.includes(expected),
+    `${expected} is no longer a validated example; if the example moved, update this list, `
+    + 'and if it lost its marker, put the marker back');
+}
+
+// The templates are what a reader is told to copy, so they are held to the schema they claim
+// to be an instance of. The two drafts are not: a draft is missing exactly the fields the
+// ledger fills in, so validating one against the record schema would only prove it is a draft.
+for (const [template, schemaFile] of [
+  ['templates/task-packet.json', 'task-packet.schema.json'],
+  ['templates/finding.json', 'finding.schema.json'],
+]) {
+  for (const error of validate(loadSchema(path.join(ROOT, 'schemas', schemaFile)),
+    JSON.parse(text(template)))) {
+    ok(false, `${template} does not satisfy ${schemaFile}: ${error.path} ${error.message}`);
+  }
+}
 
 /**
  * Evidence is an observation, and the seal covers the whole record (plan §6).
