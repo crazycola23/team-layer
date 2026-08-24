@@ -142,6 +142,15 @@ staleness against a contract revision is enforced in this layer only. That is a 
 a documented consequence, not a silent omission — see
 [protocol/spec-suite.md](protocol/spec-suite.md).
 
+The two gates compose rather than duplicate. `teamctl validate-candidate --phase
+pre-merge|post-replay` answers the semantic half — is the task current, has it been validated
+against this exact commit, did somebody with the authority approve it — and is meant to be called
+*by* spec-suite's external validation hook. It never re-derives ancestry or write scope: it reads
+`safeToMerge` out of spec-suite's own merge-gate result and refuses to guess when nobody supplied
+one. `integrationReady` is the conjunction, and it is false unless both verdicts passed and both
+are about the same commit, which is what stops a replay from pairing a pass about the old tree with
+a pass about the new one.
+
 ## Validate this skill
 
 ```bash

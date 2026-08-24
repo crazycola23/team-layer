@@ -83,6 +83,12 @@ this skill does not modify it. If a project needs the gate to enforce it too, th
 spec-suite's task contract, and this layer will project `inputs` the moment detection reports
 `semanticInputs` as supported — no change here is required.
 
+There is a way to close the gap without waiting for that, and without either project learning the
+other's domain model: spec-suite's external validation hook can call `teamctl validate-candidate`,
+which refuses a candidate whose frozen inputs have moved for the same reason `reconcile` does. The
+staleness rule still lives only here; what changes is that the merge gate can now *ask*. See
+[the semantic half, as a command](#the-semantic-half-as-a-command).
+
 `compatibility.fieldsDiscovered` is the other thing to read. When it is `false` the projectable
 field list was assumed rather than read from spec-suite, which means a field spec-suite has since
 added will silently not be projected. The assumed list is deliberately conservative for that
@@ -168,11 +174,50 @@ Respect current spec-suite behavior:
 - structural replay alone is not proof of semantic correctness;
 - a semantic validator must explicitly pass to claim semantic validation.
 
+### The semantic half, as a command
+
+The last two items are `teamctl validate-candidate`, which is this layer's side of the external
+validation hook. spec-suite runs its own structural gate and calls this for the question it cannot
+answer:
+
+```bash
+teamctl validate-candidate --phase pre-merge   --candidate git:<sha> [--structural merge-gate.json]
+teamctl validate-candidate --phase post-replay --candidate git:<sha> [--structural merge-gate.json]
+```
+
+`status` is this layer's verdict alone — `passed`, `failed`, or `unknown` — and it is the only
+field the hook has to read; anything other than `passed` is a refusal. It is deliberately *not*
+the composed answer: spec-suite is the caller, so requiring its verdict to compute this one would
+mean neither side could answer first, and composing here would make this a second merge gate.
+
+`integrationReady` is the composed answer, for whoever is holding both reports. It is a
+conjunction: semantics passed, `--structural` supplied a merge-gate result whose `safeToMerge` is
+true, and both verdicts are about the same commit. Nothing missing produces a yes — a structural
+gate nobody consulted reads `not-consulted`, which is an `unknown`, not an absence.
+
+The same-commit rule is what `--phase post-replay` exists for. Every review decision and every
+piece of evidence in this layer is bound to a candidate revision, so a replay produces a commit
+that none of them are about. Without the rule the sequence is: semantics pass at C1, the
+structural gate asks for a replay, spec-suite replays onto C2, the gate passes C2 — two genuine
+passing reports describing two different trees. `post-replay` therefore requires `--candidate`
+(the replayed commit is spec-suite's, not this worktree's HEAD) and asks the `revalidation` *and*
+`merge` gates, because a packet may declare no revalidation checks and a gate with nothing
+required reads `passed`.
+
+Exit status is 0 whether or not the candidate passes, for the same reason `validate state` is: a
+non-zero exit for "the review has not happened yet" is indistinguishable from the validator having
+failed to run, and a caller that cannot tell those apart fails open on the wrong one.
+
 ## Reviewer as semantic evidence
 
 Reviewer approval can contribute to semantic validation, but it must be bound to the exact
 candidate tree/revision being integrated. If spec-suite rebases/replays the candidate, rerun
 at least the checks necessary to prove that the approval still applies.
+
+Rerunning the executable checks is not enough on its own, and `validate-candidate --phase
+post-replay` says so: after a replay the command checks can be re-run and pass against the new
+commit, and the report will still refuse, with `review.applies` false. A human judgement about one
+tree is not a judgement about another, and no amount of re-running a suite produces an approval.
 
 Recommended semantic validator composition:
 

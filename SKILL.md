@@ -304,6 +304,13 @@ match the canonical ones, so nothing is *implemented* against a stale contract. 
 happens is the merge gate refusing such a candidate, because that check lives in spec-suite. Treat
 that as a named boundary, and do not compensate for it by weakening the gate from here.
 
+The way to close it is to have the gate ask, not to build a second one. `teamctl validate-candidate
+--phase pre-merge|post-replay` is this layer's side of spec-suite's external validation hook: its
+`status` is the semantic verdict alone, and `integrationReady` is true only when a supplied
+structural verdict passed *about the same commit*. `--phase post-replay` exists because every
+approval and every piece of evidence here is bound to a candidate revision, so a replay produces a
+commit none of them are about. See [protocol/spec-suite.md](protocol/spec-suite.md).
+
 If an authoritative input revision changes while a downstream Agent is working, treat the
 consumer as semantically stale even if Git can replay the branch without a textual conflict.
 `reconcile` answers `reissue-task` for that, never `rebase-task`: replay cannot resolve a semantic
