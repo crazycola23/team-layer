@@ -1,0 +1,77 @@
+# The three gates, run on the platform the development machine is not.
+#
+# Every commit in this repository so far was verified on Windows, where one assertion
+# cannot run at all: there are no POSIX permission bits, so the executable-bit check
+# skips. A check that has only ever skipped has never been a check. `tests/teamctl.test.mjs`
+# was written expecting this job to exist — `TEAM_LAYER_REQUIRE_POSIX=1` turns that
+# missing capability from a quiet pass into a failure, so Linux here is not redundant
+# coverage, it is the only place part of the suite actually executes.
+#
+# Two Node versions because the supported floor and the current release are different
+# programs: `engines` says >=22, and a repository that only ever runs one of them is
+# claiming compatibility it does not test. `fail-fast: false` so that a break on one
+# version does not cancel the other and hide whether it is version-specific — which is
+# the first thing you want to know.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Nothing here writes anything back.
+permissions:
+  contents: read
+
+jobs:
+  gates:
+    name: node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22', '24']
+    env:
+      TEAM_LAYER_REQUIRE_POSIX: '1'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      # No install step, and no lockfile to cache: the skill has zero dependencies on
+      # purpose, so `npm ci` would have nothing to do and would only fail for lack of a
+      # lockfile. If a dependency ever appears, this is the line that has to change.
+      - name: node and npm versions
+        run: node --version && npm --version
+
+      - name: tests
+        shell: bash
+        run: |
+          # Written outside the workspace: the repository has no .gitignore, so a log file
+          # dropped next to the sources would show up as untracked work for anyone who ran
+          # the same command locally.
+          log="${RUNNER_TEMP:-.}/test-output.txt"
+          npm test 2>&1 | tee "$log"
+          # `node --test` prints its summary behind a multibyte `ℹ`, so anchored patterns
+          # such as '^# pass' match nothing and a count read that way is silently zero.
+          # The floor is a lower bound, not the current total: it ages gracefully as tests
+          # are added and only complains when a lot of them stop running — a glob that
+          # matched no files, a renamed directory, a reporter change.
+          passed=$(grep -oE 'pass [0-9]+' "$log" | tail -1 | grep -oE '[0-9]+' || true)
+          echo "passing assertions: ${passed:-none}"
+          if [ "${passed:-0}" -lt 200 ]; then
+            echo "::error::only ${passed:-0} tests passed; the suite should be well above 200, so it is not running" >&2
+            exit 1
+          fi
+
+      # Derived schemas are generated from source constants. `--check` proves the
+      # checked-in copies match what the generator produces now, which is the drift a
+      # reviewer cannot see by reading the diff.
+      - name: derived artifacts are current
+        run: npm run gen:check
+
+      - name: skill validation
+        run: npm run validate

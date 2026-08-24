@@ -658,6 +658,57 @@ ok(/different valid implementation is not a bug/i.test(reviewer), 'reviewer must
 const product = text('roles/product-architect.md');
 ok(/leave the choice to Fullstack/i.test(product), 'product-architect must preserve local implementation freedom');
 
+/**
+ * CI must run every gate, and one test says out loud that it does.
+ *
+ * `tests/teamctl.test.mjs` skips the executable-bit assertion on Windows and justifies the
+ * skip by saying CI sets `TEAM_LAYER_REQUIRE_POSIX=1` to make it fatal instead. That is a
+ * claim about a file in a different directory, in a language nothing in this repo executes,
+ * and it was false for as long as there was no workflow. A comment that licenses a skip has
+ * to be checkable, or the skip quietly becomes permanent.
+ *
+ * The same reasoning covers the gates themselves: a workflow that drops `gen:check` still
+ * shows a green tick, and green is the only thing anyone reads.
+ */
+const CI_WORKFLOW = '.github/workflows/ci.yml';
+ok(fs.existsSync(path.join(ROOT, CI_WORKFLOW)), `missing ${CI_WORKFLOW}`);
+if (fs.existsSync(path.join(ROOT, CI_WORKFLOW))) {
+  const ci = text(CI_WORKFLOW);
+  for (const gate of ['npm test', 'npm run gen:check', 'npm run validate']) {
+    ok(ci.includes(gate), `${CI_WORKFLOW} must run ${gate}: a gate CI does not run is a gate nobody runs`);
+  }
+  ok(/TEAM_LAYER_REQUIRE_POSIX:\s*'1'/.test(ci),
+    `${CI_WORKFLOW} must set TEAM_LAYER_REQUIRE_POSIX=1, which is what tests/teamctl.test.mjs `
+    + 'cites as the reason its Windows skip is not a permanent hole');
+  // Anchored to a whole line, because this file explains `fail-fast: false` in its header
+  // comment and a substring match was satisfied by the explanation while the setting itself
+  // said `true`. An assertion a comment can satisfy is an assertion about comments.
+  ok(/^\s*fail-fast:\s*false\s*$/m.test(ci),
+    `${CI_WORKFLOW} must set fail-fast: false, so one version failing does not cancel the other `
+    + 'and hide whether the break is version-specific');
+  // Read the matrix specifically rather than every quoted number in the file: a loose scan
+  // also picks up `TEAM_LAYER_REQUIRE_POSIX: '1'` and would call it a tested Node version.
+  const matrix = /node:\s*\[([^\]]*)\]/.exec(ci)?.[1] ?? '';
+  const versions = [...matrix.matchAll(/'(\d+)'/g)].map((m) => m[1]);
+  const engines = JSON.parse(text('package.json')).engines?.node ?? '';
+  const floor = /(\d+)/.exec(engines)?.[1];
+  ok(floor && versions.includes(floor),
+    `${CI_WORKFLOW} must test Node ${floor}, the floor package.json engines declares; `
+    + `its matrix is [${versions.join(', ')}]`);
+  ok(versions.some((v) => Number(v) > Number(floor)),
+    `${CI_WORKFLOW} must also test a Node newer than the ${floor} floor: supporting a range `
+    + 'means running both ends of it');
+  // The workflow refuses a run whose passing count falls below a floor, because `npm test`
+  // exits 0 when its glob matches nothing and a green tick over an empty suite is the most
+  // expensive kind of false confidence. A floor that a fraction of the suite could clear
+  // does not measure whether the suite ran, so the floor itself is held to a minimum. It is
+  // a lower bound on a lower bound: the count only grows, so this ages without maintenance.
+  const claimed = Number(/-lt (\d+) \]/.exec(ci)?.[1] ?? 0);
+  ok(claimed >= 100,
+    `${CI_WORKFLOW} must refuse a suite smaller than a substantial floor, found ${claimed}: `
+    + 'a floor low enough for a broken run to clear is the same as no floor');
+}
+
 if (failures.length) {
   console.error(`validation failed (${failures.length}):`);
   for (const failure of failures) console.error(`- ${failure}`);
