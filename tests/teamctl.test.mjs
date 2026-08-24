@@ -2,12 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import os from 'node:os';
-import { execFileSync, spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
 
-const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const CLI = path.join(ROOT, 'scripts', 'teamctl.mjs');
+import {
+  CLI, ROOT, bootstrapped, fixture, git, refusal, run, taskPacket, writeDraft, writePacket,
+} from './helpers/cli.mjs';
 
 /**
  * Windows has no POSIX permission bits, so an executable-bit assertion cannot
@@ -22,41 +20,6 @@ function hasCapability(t, name, available) {
   }
   t.diagnostic(`skipped assertion: ${name} unavailable on ${process.platform}`);
   return false;
-}
-
-function git(args, cwd) {
-  return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
-}
-
-function fixture() {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'persistent-agent-team-'));
-  const repo = path.join(dir, 'repo');
-  const home = path.join(dir, 'agent-home');
-  fs.mkdirSync(repo);
-  git(['init'], repo);
-  git(['config', 'user.email', 'test@example.com'], repo);
-  git(['config', 'user.name', 'Test'], repo);
-  fs.writeFileSync(path.join(repo, 'README.md'), '# fixture\n');
-  git(['add', 'README.md'], repo);
-  git(['commit', '-m', 'init'], repo);
-  return { dir, repo, home };
-}
-
-/**
- * `env` overlays the inherited environment, and an empty string un-sets a variable.
- *
- * Needed because `SPEC_SUITE_ROOT` is a real variable an operator may have exported: a test
- * asserting what happens when nobody named a spec-suite would otherwise pass or fail
- * depending on the machine it ran on.
- */
-function run(args, { repo, home, env = {} }, expect = 0) {
-  const res = spawnSync(process.execPath, [CLI, ...args], {
-    cwd: repo,
-    env: { ...process.env, AGENT_TEAM_HOME: home, ...env },
-    encoding: 'utf8',
-  });
-  assert.equal(res.status, expect, `stdout=${res.stdout}\nstderr=${res.stderr}`);
-  return res;
 }
 
 test('Claude setup creates harness-neutral identity and local adapter idempotently', () => {
@@ -145,55 +108,8 @@ test('doctor reports a healthy configured worktree', () => {
 // already covers the semantics; what is left to prove is the part only the CLI
 // owns — that a refusal reaches a caller as a distinguishable exit code, that
 // the actor recorded is the bound identity rather than whatever was typed, and
-// that two worktrees really do land on one ledger.
-
-/** A task packet for `session`, valid unless deliberately broken by the caller. */
-function taskPacket(overrides = {}) {
-  return {
-    schemaVersion: 2,
-    taskId: 'task:coupon-api',
-    sessionId: 'feature:coupon',
-    subject: 'agent:fullstack-01',
-    role: 'fullstack',
-    baseRevision: 'git:abc1234',
-    readSet: ['src/**'],
-    writeSet: ['src/coupon/**'],
-    inputs: [{ id: 'contract:coupon', revision: `sha256:${'1'.repeat(64)}`, authority: 'product-architect' }],
-    acceptance: ['AC-1 discount applies at most once'],
-    validationPlan: [
-      { checkId: 'unit-tests', kind: 'command', requiredAt: ['handoff', 'merge'], command: 'npm test' },
-    ],
-    ...overrides,
-  };
-}
-
-function writePacket(f, packet, name = 'packet.json') {
-  const file = path.join(f.repo, name);
-  fs.writeFileSync(file, `${JSON.stringify(packet, null, 2)}\n`);
-  return file;
-}
-
-function writeDraft(f, draft, name = 'draft.json') {
-  const file = path.join(f.repo, name);
-  fs.writeFileSync(file, `${JSON.stringify(draft, null, 2)}\n`);
-  return file;
-}
-
-/** The refusal a command produced: `{code, exit}`, or null if it was allowed. */
-function refusal(args, f) {
-  const res = spawnSync(process.execPath, [CLI, ...args], {
-    cwd: f.repo, env: { ...process.env, AGENT_TEAM_HOME: f.home }, encoding: 'utf8',
-  });
-  if (res.status === 0) return null;
-  assert.match(res.stderr, /"status": "refused"/, `expected a structured refusal, got: ${res.stderr}`);
-  return { code: JSON.parse(res.stderr).code, exit: res.status };
-}
-
-function bootstrapped({ agentId = 'fullstack-01', role = 'fullstack' } = {}) {
-  const f = fixture();
-  run(['setup', '--agent-id', agentId, '--role', role, '--harness', 'claude-code', '--repo', '.'], f);
-  return f;
-}
+// that two worktrees really do land on one ledger. The fixtures are in
+// tests/helpers/cli.mjs, shared with the §17 scenario suite.
 
 test('a session and task round-trip through the CLI', () => {
   const f = bootstrapped();
@@ -1092,9 +1008,13 @@ test('reconcile finds this agent task and answers at exit 0 whatever it finds', 
  *
  * One session holds several Agents' tasks by design, so the filter on `frozen.subject` is the
  * only thing standing between a recovering Agent and somebody else's work — and it would be
- * handed over with the ledger's blessing, writeSet and all. Naming the session is what makes
- * `await-task` sayable: without it nothing in the ledger associates this Agent with a session at
- * all, and the honest answer is the one the previous test gets.
+ * handed over with the ledger's blessing, writeSet and all.
+ *
+ * The session is reached twice here by two different routes: `--session` names it, and blind,
+ * `participation` finds it from this Agent's own events. What must not differ between the routes
+ * is the task, and `await-task` is right either way — an Agent that issued work to somebody else
+ * is waiting on it, not sitting in a repository with no session in it. Blind used to answer
+ * `open-session`, which told it to start a second session for work it had just set up itself.
  */
 test('reconcile ignores a task addressed to another agent', () => {
   const f = bootstrapped();
@@ -1109,8 +1029,8 @@ test('reconcile ignores a task addressed to another agent', () => {
   assert.match(named.reasons[0], /feature:coupon has no task addressed to this agent/);
 
   const blind = JSON.parse(run(['reconcile'], f).stdout);
-  assert.equal(blind.task, null);
-  assert.equal(blind.nextAction, 'open-session');
+  assert.deepEqual([blind.session, blind.task, blind.nextAction],
+    ['feature:coupon', null, 'await-task'], 'the flag changes how the session is found, not the answer');
 });
 
 /**
@@ -1226,6 +1146,38 @@ test('reconcile refuses to answer from a log whose tail is missing', () => {
 });
 
 /**
+ * A session nobody could read is named, not quietly counted as no mail.
+ *
+ * The refusal above is only for the session being answered about. A corrupt session *elsewhere*
+ * in the Agent home is tolerated, because refusing there would let one unreadable session take
+ * recovery down for every agent — the tolerance `inbox` exists for. What that tolerance costs is
+ * that "no unacknowledged handoffs" really means "none in the sessions I could read", and those
+ * two are the same answer only when nothing was skipped. So the list has to be capable of being
+ * non-empty: reporting it as always empty converts the tolerance back into the confident wrong
+ * answer it was built to avoid, and every existing assertion on this field reads `[]` from a home
+ * where `[]` is also the truth.
+ */
+test('reconcile names a session it could not read rather than counting it as no mail', () => {
+  const f = bootstrapped();
+  run(['session', 'start', '--session', 'feature:coupon', '--target', 'main'], f);
+  writePacket(f, taskPacket());
+  run(['task', 'issue', '--packet', 'packet.json'], f);
+  // A second session, holding no task for this agent, so the answer still comes from the first.
+  run(['session', 'start', '--session', 'feature:legacy', '--target', 'main'], f);
+
+  const events = path.join(f.repo, '.git', 'team-layer', 'sessions', 'feature__legacy', 'events.jsonl');
+  const kept = fs.readFileSync(events, 'utf8').split('\n').filter((line) => line !== '').slice(0, -1);
+  fs.writeFileSync(events, kept.length ? `${kept.join('\n')}\n` : '');
+
+  const out = JSON.parse(run(['reconcile'], f).stdout);
+  assert.equal(out.session, 'feature:coupon', 'the readable session is still the one answered about');
+  assert.deepEqual(out.detail.unreadableSessions,
+    [{ sessionId: 'feature:legacy', code: 'LEDGER_CORRUPT' }]);
+  assert.deepEqual(out.detail.unackedHandoffs, [],
+    'an empty inbox next to a named unreadable session is honest; on its own it would not be');
+});
+
+/**
  * The default answer for inputs is `unknown`, and it is not a bug.
  *
  * This layer holds `{ id, revision }` and the canonical authority resolves revisions from
@@ -1335,6 +1287,66 @@ test('reconcile surfaces an unacknowledged handoff addressed to this agent', () 
   assert.deepEqual(out.detail.unackedHandoffs[0].from, { subject: 'agent:reviewer-01', role: 'reviewer' });
   assert.ok(out.reasons.some((r) => /validation is unknown/.test(r)),
     'the losing finding is still reported, so the precedence can be argued with');
+});
+
+/**
+ * Waiting mail outranks a session this Agent merely worked in before.
+ *
+ * Both routes can name a session for an Agent holding no task, and they can name different ones:
+ * a reviewer that acknowledged its last handoff has participation in the old session and nothing
+ * waiting there, while the new letter is in a session it has never touched. Mail is the route that
+ * names work somebody is waiting on; participation only names a place. Resolving to the old
+ * session does not merely answer `await-task` instead of `ack-handoff` — it drops the letter
+ * entirely, because the unacknowledged handoffs reported are the ones in the session that was
+ * chosen. The Agent would be told to sit in the room it was last seen in while its next task sat
+ * unread next door.
+ *
+ * The order is encoded twice on purpose — the guard that skips the participation lookup while mail
+ * is waiting, and the order of the fallback chain — so this holds if either one is loosened.
+ */
+test('reconcile answers with waiting mail rather than the session it last acted in', () => {
+  const f = bootstrapped({ agentId: 'fullstack-01', role: 'fullstack' });
+  const branch = git(['rev-parse', '--abbrev-ref', 'HEAD'], f.repo);
+  const linked = path.join(f.dir, 'wt-reviewer');
+  git(['worktree', 'add', linked, '-b', 'review'], f.repo);
+  const g = { dir: f.dir, repo: linked, home: f.home };
+  run(['setup', '--agent-id', 'reviewer-01', '--role', 'reviewer', '--harness', 'codex', '--repo', linked], g);
+
+  // The old session: reviewed, acknowledged, nothing waiting — participation and nothing else.
+  run(['session', 'start', '--session', 'feature:coupon', '--target', branch], f);
+  writePacket(f, taskPacket());
+  run(['task', 'issue', '--packet', 'packet.json'], f);
+  writeDraft(f, {
+    sessionId: 'feature:coupon',
+    taskId: 'task:coupon-api',
+    to: { role: 'reviewer' },
+    nextAction: 'review',
+    summary: 'Coupon path is ready to look at.',
+  });
+  const first = JSON.parse(run(['handoff', 'publish', '--handoff', 'draft.json'], f).stdout);
+  run(['handoff', 'ack', '--session', 'feature:coupon', '--handoff', first.handoffId], g);
+
+  const only = JSON.parse(run(['reconcile'], g).stdout);
+  assert.deepEqual([only.session, only.nextAction], ['feature:coupon', 'await-task'],
+    'with nothing waiting, participation is the route that finds a session at all');
+
+  // The new session, which this reviewer has never acted in.
+  run(['session', 'start', '--session', 'feature:refund', '--target', branch], f);
+  writePacket(f, taskPacket({ taskId: 'task:refund-api', sessionId: 'feature:refund' }), 'refund.json');
+  run(['task', 'issue', '--packet', 'refund.json'], f);
+  writeDraft(f, {
+    sessionId: 'feature:refund',
+    taskId: 'task:refund-api',
+    to: { role: 'reviewer' },
+    nextAction: 'review',
+    summary: 'Refund path is ready to look at.',
+  }, 'draft-2.json');
+  const second = JSON.parse(run(['handoff', 'publish', '--handoff', 'draft-2.json'], f).stdout);
+
+  const out2 = JSON.parse(run(['reconcile'], g).stdout);
+  assert.deepEqual([out2.session, out2.nextAction], ['feature:refund', 'ack-handoff'],
+    'the letter is in the newer session; the older one is only where this agent was last seen');
+  assert.deepEqual(out2.detail.unackedHandoffs.map((row) => row.handoffId), [second.handoffId]);
 });
 
 /**

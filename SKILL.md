@@ -35,10 +35,10 @@ handoffs, recovery, and the team protocol between them.
 1. **Identity is durable; harness is replaceable.** `agentId + role` remain stable when Claude/Codex/Gemini/model changes.
 2. **Conversation is volatile.** Never treat chat history as authoritative durable state.
 3. **Shared facts are canonical, not personal.** Agents may have different judgments; they must not maintain different versions of shared facts.
-4. **Unknown stays unknown.** Missing product/contract facts become unresolved; do not infer a “reasonable default” that another Agent will depend on.
+4. **Unknown stays unknown.** Missing product/contract facts become unresolved; do not infer a “reasonable default” that another Agent will depend on. The tools hold the same line: freshness, capability support, and whether an approval still applies are all three-valued, and `unknown` is never widened into a pass.
 5. **Role owns decisions, not private truth.** Product Architect owns product/system-boundary decisions; Fullstack owns local implementation decisions; Reviewer owns approval findings. Evidence can overturn anyone.
 6. **Code is candidate state until validated.** A commit is not “done” merely because an Agent says it is done.
-7. **Recovery beats memory.** After restart/compaction, reconstruct state from identity, task/session artifacts, canonical inputs, and Git.
+7. **Recovery beats memory.** After restart/compaction, reconstruct state from identity, task/session artifacts, canonical inputs, and Git — start with `teamctl reconcile`, which does it from the ledger rather than from what you recall.
 8. **Coordination must earn its cost.** Solo work stays solo. Team mode is for work with real cross-role value.
 
 Short form:
@@ -83,16 +83,38 @@ Read [protocol/identity.md](protocol/identity.md) for the durable data model and
 
 ## 3. Every start/resume: deterministic recovery
 
-Before substantive work, and again after context compaction or an uncertain handoff:
+Before substantive work, and again after context compaction or an uncertain handoff, run:
 
-1. Read `.agent-team-binding.json` and the referenced durable `identity.json`.
-2. Read **only your own** role file under `roles/`.
-3. Read [protocol/core.md](protocol/core.md).
-4. If resuming work, execute [protocol/recovery.md](protocol/recovery.md).
-5. Read the current task/session artifact and your latest role checkpoint/handoff.
-6. Read canonical dependencies/unresolved state from spec-suite when adopted.
-7. Inspect `git status`, current branch/worktree, and relevant `git log`/diff.
-8. Continue from durable evidence. Do not reconstruct authority from remembered conversation.
+```bash
+node scripts/teamctl.mjs reconcile
+```
+
+It takes no arguments: an Agent that has lost its context cannot be asked which session it was in,
+so identity, session, task and candidate are all derived. It answers with `status`, `session`,
+`task`, `freshness` and a single `nextAction`, and `reasons[0]` is the one that chose that action.
+It exits `0` whatever it finds, so a finding is never confusable with a failure to look.
+
+Then do by hand only what a command cannot do for you:
+
+1. Read **only your own** role file under `roles/`.
+2. Read [protocol/core.md](protocol/core.md).
+3. Read your latest role checkpoint/handoff, and the review or handoff the answer points at.
+4. Supply canonical input revisions the command cannot observe — see below.
+5. Continue from durable evidence. Do not reconstruct authority from remembered conversation.
+
+`freshness.inputs` reads `unknown` until somebody supplies what the canonical authority currently
+says, because nothing here knows where `contract:coupon` lives:
+
+```bash
+node scripts/teamctl.mjs reconcile --canonical-inputs canonical.json
+```
+
+`unknown` is a third value, not a soft `fresh`. Do not act on a task whose input freshness was
+never established as though it had been checked.
+
+Read [protocol/recovery.md](protocol/recovery.md) for the manual sequence, the three routes the
+command uses to find a session, and the contradiction rules. Execute it by hand when the answer
+needs interpreting, when the command is unavailable, or when durable sources disagree.
 
 If durable state and conversation disagree, durable state wins unless the user explicitly
 supersedes it and that change is persisted through the owning protocol.
@@ -232,6 +254,22 @@ review approval                  semantic validation evidence
 The current spec-suite merge gate must remain authoritative for its concurrency contract.
 Do not weaken it from this skill.
 
+Project with:
+
+```bash
+node scripts/teamctl.mjs project-spec-task \
+  --session feature:coupon --task task:coupon-api \
+  --spec-suite ../spec-suite --output .spec-suite-task.json
+```
+
+The projection is a whitelist and the compatibility report is part of the answer, not a log line.
+Read `compatibility.mode`: `full` means every capability-governed field was carried across;
+`degraded` means something stayed behind and `compatibility.warnings` says what the consequence is.
+There is no capability handshake to rely on, so support is `supported`/`unsupported`/`unknown` and
+`unknown` is treated as cannot. See
+[protocol/spec-suite.md](protocol/spec-suite.md) for what each answer means and for the two names
+that mean different things on the two sides of the boundary.
+
 ## 11. Semantic dependency rule
 
 `readSet` is useful for scheduling/scope, but cooperative coding Agents often depend most
@@ -252,10 +290,24 @@ packet as semantic `inputs` with revisions/digests when available:
 
 This `inputs` field is a team-layer dependency until/unless the installed spec-suite version
 supports it natively. Do not inject unsupported fields into a spec-suite artifact that rejects
-them. Mirror only the fields its current schema accepts.
+them — and note that the hazard is the opposite one: spec-suite accepts unknown task fields
+*silently*, so an unsupported field does not announce itself. Mirror only the fields its current
+schema accepts, by whitelist.
+
+No installed spec-suite version carries semantic `inputs`, so today the projection withholds it and
+the consequence is explicit:
+
+> **staleness against a contract revision is enforced only in the team layer.**
+
+`teamctl reconcile` refuses to let an Agent act on a task whose frozen input revisions no longer
+match the canonical ones, so nothing is *implemented* against a stale contract. What no longer
+happens is the merge gate refusing such a candidate, because that check lives in spec-suite. Treat
+that as a named boundary, and do not compensate for it by weakening the gate from here.
 
 If an authoritative input revision changes while a downstream Agent is working, treat the
 consumer as semantically stale even if Git can replay the branch without a textual conflict.
+`reconcile` answers `reissue-task` for that, never `rebase-task`: replay cannot resolve a semantic
+change, only restating the task can.
 
 ## 12. Stop / escalate conditions
 

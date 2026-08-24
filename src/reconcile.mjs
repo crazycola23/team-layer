@@ -188,16 +188,31 @@ export function decide(state) {
   // wrong half. The installer checks these literals against both vocabularies, which only works
   // if the position of each is fixed.
   const finding = (status, nextAction, reason) => findings.push({ nextAction, status, reason });
+  const mail = (n) => `${n} unacknowledged handoff${n === 1 ? '' : 's'} addressed to this agent`;
 
   if (!binding) {
     return answer('unbound', 'bind-worktree',
       ['this worktree has no agent binding, so it cannot say who is asking']);
   }
-  if (!session) {
-    return answer('idle', 'open-session',
-      ['no session holds a task for this agent']);
-  }
-  if (!task) {
+  // A handoff is addressed to a *role*, so it is the one finding that exists before this agent
+  // holds anything — and a reviewer is the ordinary case, not an edge one: it is sent work and
+  // never holds a task of its own. Answering `open-session` or `await-task` to an agent with
+  // mail waiting is the recovery path telling it to sit idle, which is worse than it sounds,
+  // because this command is what an agent consults *instead of* remembering. There is nothing
+  // downstream to correct it with.
+  if (!session || !task) {
+    if (handoffs.length) {
+      return answer('ready', 'ack-handoff', [
+        mail(handoffs.length),
+        session
+          ? `session ${session.sessionId} has no task addressed to this agent, so the handoff is all it holds`
+          : 'no task is addressed to this agent, so the handoff is all it holds',
+      ]);
+    }
+    if (!session) {
+      return answer('idle', 'open-session',
+        ['no session holds a task for this agent']);
+    }
     return answer('idle', 'await-task',
       [`session ${session.sessionId} has no task addressed to this agent`]);
   }
@@ -210,8 +225,7 @@ export function decide(state) {
   }
   if (task.state.status === 'blocked') finding('blocked', 'unblock-task', `task ${task.frozen.taskId} is parked as blocked`);
   if (handoffs.length) {
-    finding('ready', 'ack-handoff',
-      `${handoffs.length} unacknowledged handoff${handoffs.length === 1 ? '' : 's'} addressed to this agent`);
+    finding('ready', 'ack-handoff', mail(handoffs.length));
   }
   if (review?.status === 'changes-requested' && review.applies !== false) {
     finding('ready', 'address-review',

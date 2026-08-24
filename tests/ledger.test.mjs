@@ -704,6 +704,62 @@ test('inbox reports a corrupt session as a row rather than throwing the queue aw
 });
 
 /**
+ * "Where was I" has to stay answerable after the mail is gone.
+ *
+ * `inbox` empties on acknowledgement and a reviewer holds nothing else — it never owns a task —
+ * so between acking a handoff and recording the decision no artifact ties it to the session it
+ * is working in. The event log does, because every event names the actor that caused it, and
+ * that is the difference between the recovery path saying "wait here" and saying "start a
+ * second session for the work already under way".
+ *
+ * Terminal sessions are excluded, and asserted here rather than left to the caller: a completed
+ * session will never hold a task again, so offering it as the place to wait is advice that
+ * cannot come good.
+ */
+test('participation finds the sessions an agent acted in, newest first, minus the finished ones', () => {
+  const ledger = tempLedger();
+  const act = (sessionId, actor) => {
+    ledger.createSession({ sessionId, integrationTarget: 'main', actor });
+    return sessionId;
+  };
+  act('feature:one', 'agent:reviewer-01');
+  act('feature:two', 'agent:fullstack-01');
+  act('feature:three', 'agent:reviewer-01');
+
+  // Ordering is by last activity, not by session name: `feature:two` is touched last and comes
+  // first even though it sorts last, and the reviewer never touched it at all.
+  ledger.setSessionStatus('feature:two', 'product-definition', { actor: 'agent:reviewer-01' });
+
+  const seen = ledger.participation({ subject: 'agent:reviewer-01' });
+  assert.deepEqual(seen.map((row) => row.sessionId), ['feature:two', 'feature:three', 'feature:one']);
+  assert.deepEqual(seen[0], {
+    sessionId: 'feature:two',
+    sessionStatus: 'product-definition',
+    lastAt: seen[0].lastAt,
+    lastKind: 'session-status-changed',
+    events: 1,
+  }, 'the row says what the agent last did there, so a caller can tell resuming from starting');
+
+  // An agent that has done nothing anywhere gets an empty list rather than somebody else's work.
+  assert.deepEqual(ledger.participation({ subject: 'agent:nobody-01' }), []);
+  assert.deepEqual(ledger.participation({ subject: 'agent:fullstack-01' }).map((r) => r.sessionId),
+    ['feature:two']);
+
+  // Cancelling drops it out, and the runner-up takes its place.
+  ledger.setSessionStatus('feature:two', 'cancelled', { actor: 'agent:fullstack-01' });
+  assert.deepEqual(ledger.participation({ subject: 'agent:reviewer-01' }).map((r) => r.sessionId),
+    ['feature:three', 'feature:one']);
+
+  // A session nobody can read is skipped, not thrown: this is the recovery path, and it is
+  // `inbox` that reports the corruption as a row.
+  fs.writeFileSync(ledger.sessionFile('feature:three'), '{ not json');
+  assert.deepEqual(ledger.participation({ subject: 'agent:reviewer-01' }).map((r) => r.sessionId),
+    ['feature:one']);
+
+  assert.equal(code(() => ledger.participation({ subject: '' })), 'MALFORMED_ID');
+});
+
+/**
  * An ack is what empties a queue, so only the addressee may issue one.
  *
  * The damage from getting this wrong is not a misattributed event: the handoff

@@ -47,6 +47,11 @@ When sources disagree, prefer this order unless the repository defines stronger 
 
 Conversation is intentionally last among useful sources.
 
+Items 3 and 5 are the session ledger: sealed records and an append-only event log in the Git common
+directory, shared by every linked worktree and read with `teamctl` rather than reconstructed. A
+truncated log makes the tools refuse rather than report a smaller number, so a number they give you
+is not a partial count.
+
 ## Minimal context principle
 
 Always load:

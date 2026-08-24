@@ -993,14 +993,31 @@ function reconcileCommand(args) {
 
   runLedger(() => {
     const found = binding ? currentTask(ledger, subject, args) : null;
+    // Mail is read before the session is settled, because for a reviewer it is the only thing
+    // that names one: handoffs are addressed to a role, and a reviewer never holds a task of its
+    // own. `ledger.inbox` scans every session and tolerates one it cannot read, which is what
+    // makes it usable this early — and its unreadable rows are dropped here rather than used to
+    // resolve a session, because reading one would throw and turn a single corrupt session
+    // anywhere in the home into a refusal for every agent, which is the tolerance it exists for.
+    const rows = binding ? ledger.inbox({ role: binding.role, subject }) : [];
+    const waiting = rows.filter((row) => !row.unreadable);
+    const unreadable = rows.filter((row) => row.unreadable);
     // A session named on the command line is read even when it holds no task for this agent, so
-    // the answer can be `await-task`. Without the flag a session is only reachable *through* a
-    // task — nothing associates an Agent with a session until one is addressed to it — and
-    // answering `open-session` to an Agent whose session already exists sends it into a
-    // collision it cannot act on from there.
+    // the answer can be `await-task`. Without the flag a session is reachable three ways, in
+    // descending order of how much it says about what to do now: a task addressed to this agent,
+    // mail addressed to it, and — last — a session it has acted in before. Answering
+    // `open-session` to an Agent whose session already exists sends it into a collision it
+    // cannot act on from there, so the last fallback matters even though it names no work:
+    // `await-task` in the session you were in is the honest answer, and `participation` is what
+    // makes it reachable for a reviewer that has already acknowledged its mail.
     const named = typeof args.session === 'string' && args.session !== '' ? args.session : null;
+    const revisited = binding && !found && !named && !waiting.length
+      ? ledger.participation({ subject })[0]?.sessionId ?? null
+      : null;
     const session = found?.session
-      ?? (named && ledger.listSessions().includes(named) ? ledger.readSession(named) : null);
+      ?? (named && ledger.listSessions().includes(named) ? ledger.readSession(named) : null)
+      ?? (waiting.length ? ledger.readSession(waiting[0].sessionId) : null)
+      ?? (revisited ? ledger.readSession(revisited) : null);
     const task = found?.task ?? null;
 
     const target = session?.integrationTarget ?? null;
@@ -1025,10 +1042,13 @@ function reconcileCommand(args) {
     }
     const inputs = inputsFreshness({ inputs: task?.frozen.inputs ?? null, observed });
 
+    // With a task, mail about a *different* task is not this answer's business: reconcile
+    // answers about one task, and a handoff about another would push aside the finding the
+    // caller asked for. With no task there is nothing to be beside, and the mail is the whole
+    // answer — filtering it out there is what left `ack-handoff` unreachable for a reviewer.
     const handoffs = task
-      ? ledger.inbox({ role: binding.role, subject })
-        .filter((row) => row.sessionId === session.sessionId && row.taskId === task.frozen.taskId)
-      : [];
+      ? waiting.filter((row) => row.sessionId === session.sessionId && row.taskId === task.frozen.taskId)
+      : waiting.filter((row) => row.sessionId === session?.sessionId);
     const gate = task ? gateFor(task, args) : null;
     const candidate = typeof args.candidate === 'string' && args.candidate !== ''
       ? args.candidate
@@ -1061,6 +1081,12 @@ function reconcileCommand(args) {
         inputs,
         candidateRevision,
         unackedHandoffs: handoffs.map((row) => ({ handoffId: row.handoffId, from: row.from, nextAction: row.nextAction, stale: row.stale })),
+        // A session whose log could not be read is named rather than dropped. `unackedHandoffs`
+        // is derived by walking every session, so an empty list next to a session nobody could
+        // read is "no mail that I could see" reported as "no mail" — the confident wrong answer
+        // this command's three-valued freshness exists to avoid, in the one field that was still
+        // two-valued.
+        unreadableSessions: unreadable.map((row) => ({ sessionId: row.sessionId, code: row.unreadable })),
         review: review === null ? null : { status: review.status, reviewId: review.reviewId, applies: review.applies, reasons: review.reasons, unresolvedFindings: review.unresolvedFindings },
         validation: validation === null ? null : { gate: validation.gate, status: validation.status, required: validation.required, passed: validation.passed, failed: validation.failed, unknown: validation.unknown },
       },

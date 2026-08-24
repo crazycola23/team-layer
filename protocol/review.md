@@ -50,3 +50,36 @@ Approval becomes stale when any is true:
 
 A pure Git metadata/branch-name change that does not alter the approved tree may be treated
 according to project policy, but do not assume tree equivalence without checking it.
+
+### Ask, do not remember
+
+The list above is a rule that has to be applied at the moment of integration, which is exactly when
+the Agent holding the approval in mind is least likely to re-derive it. So it is answerable:
+
+```bash
+node scripts/teamctl.mjs review state --session feature:coupon --task task:coupon-api
+```
+
+`status` is what the reviewer said. `applies` is whether it still says it about the tree in front of
+you, and those are different questions:
+
+```text
+status: approved   applies: true    integrate
+status: approved   applies: false   the approval was real and no longer applies; reasons say why
+status: approved   applies: null    no candidate to compare against; nothing was established
+```
+
+`reasons` names the invalidating condition rather than leaving it to be guessed:
+
+```text
+no-review          nobody has reviewed this candidate
+candidate-moved    the tree moved after the approval — the third and fourth bullets above
+inputs-moved       a frozen input revision no longer matches canonical — the second bullet
+candidate-unknown  the candidate revision could not be read
+```
+
+`applies: null` is not a lenient `true`. An unanswerable question is not an approval, and the
+distinction is the whole reason the field is three-valued.
+
+`teamctl reconcile` consumes the same answer, which is why it stops saying `integrate` the moment a
+commit lands after approval — without the reviewer having to be asked again to notice.

@@ -177,6 +177,38 @@ test('a bound agent with no session opens one; with no task it waits', () => {
   assert.equal(decide(state({ task: null })).nextAction, 'await-task');
 });
 
+/**
+ * Mail outranks having nothing, because a reviewer never has anything else.
+ *
+ * A handoff is addressed to a role, so it is the one finding that can exist before this Agent
+ * holds a task — and for a reviewer that is not an edge case but the whole job: it is sent work
+ * and never owns a task of its own. Answering `open-session` or `await-task` to an Agent with
+ * unread mail is the recovery path telling it to sit idle, and there is nothing downstream to
+ * correct it with: this command is what an Agent consults *instead of* remembering.
+ *
+ * Both shapes are asserted because the reviewer arrives at each one. Session-and-no-task is the
+ * ordinary case; no-session-at-all is what the CLI hands over when the only thing naming a
+ * session is the mail itself, and the reason has to say which of the two it was.
+ */
+test('an agent holding no task is sent to its mail, not told to sit idle', () => {
+  const mail = [{ handoffId: 'handoff:fullstack-to-reviewer-1' }];
+
+  const waiting = decide(state({ task: null, handoffs: mail }));
+  assert.equal(waiting.status, 'ready');
+  assert.equal(waiting.nextAction, 'ack-handoff');
+  assert.match(waiting.reasons[0], /^1 unacknowledged handoff addressed to this agent$/);
+  assert.match(waiting.reasons[1], /session sess-1 has no task addressed to this agent/);
+
+  const sessionless = decide(state({ session: null, task: null, handoffs: mail }));
+  assert.equal(sessionless.nextAction, 'ack-handoff');
+  assert.match(sessionless.reasons[1], /^no task is addressed to this agent/);
+
+  // Plural, because a queue of one and a queue of four are different situations and the count is
+  // the only part of this answer an Agent can act on differently.
+  assert.match(decide(state({ task: null, handoffs: [...mail, { handoffId: 'h2' }] })).reasons[0],
+    /^2 unacknowledged handoffs /);
+});
+
 test('nothing in the way means carry on, and the reason says so', () => {
   const result = decide(state());
   assert.equal(result.status, 'ready');

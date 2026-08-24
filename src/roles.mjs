@@ -30,13 +30,24 @@ const ROLE_ID = /^[a-z][a-z0-9-]{1,39}$/;
 
 let cached;
 
-export function loadRegistry({ reload = false } = {}) {
-  if (cached && !reload) return cached;
+/**
+ * `registryPath` names a registry other than the installed one, and is never cached.
+ *
+ * It exists so that proving the loader rejects a malformed registry does not require writing a
+ * malformed registry to `roles/registry.json` — the file every other module reads. Test files run
+ * in parallel processes that share a filesystem, so a test doing that makes an unrelated test in
+ * another file fail on whatever byte happened to be on disk when it looked, and the failure
+ * surfaces far from its cause. Reading an override past the cache, and refusing to write to it,
+ * is what keeps one caller's malformed registry from becoming every later caller's answer.
+ */
+export function loadRegistry({ reload = false, registryPath = null } = {}) {
+  if (cached && !reload && !registryPath) return cached;
+  const source = registryPath ?? REGISTRY_PATH;
   let raw;
   try {
-    raw = JSON.parse(fs.readFileSync(REGISTRY_PATH, 'utf8'));
+    raw = JSON.parse(fs.readFileSync(source, 'utf8'));
   } catch (error) {
-    throw new RoleError('REGISTRY_UNREADABLE', `${REGISTRY_PATH} is missing or invalid JSON: ${error.message}`);
+    throw new RoleError('REGISTRY_UNREADABLE', `${source} is missing or invalid JSON: ${error.message}`);
   }
   if (raw?.schemaVersion !== 1) {
     throw new RoleError('REGISTRY_VERSION', `role registry schemaVersion must be 1, got ${JSON.stringify(raw?.schemaVersion)}`);
@@ -70,8 +81,9 @@ export function loadRegistry({ reload = false } = {}) {
 
   // Sorted for deterministic derived output; the file itself may list any order.
   const ids = roles.map((role) => role.id).sort();
-  cached = { roles, ids, byId: new Map(roles.map((role) => [role.id, role])) };
-  return cached;
+  const registry = { roles, ids, byId: new Map(roles.map((role) => [role.id, role])) };
+  if (!registryPath) cached = registry;
+  return registry;
 }
 
 export function roleIds() {

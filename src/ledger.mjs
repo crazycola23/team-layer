@@ -1028,6 +1028,61 @@ export class Ledger {
     }
     return rows;
   }
+
+  /**
+   * Sessions this agent has acted in, most recent activity first.
+   *
+   * `inbox` stops answering the moment mail is acknowledged, and for a reviewer there is
+   * nothing else: it never holds a task of its own, so once the handoff is acked no artifact
+   * associates it with the session it is reviewing in. Losing context between acknowledging a
+   * handoff and recording the decision is two steps apart, not exotic, and the recovery path
+   * answered it with `open-session` — telling an Agent to start a second session for work
+   * already under way, in a layer whose whole purpose is that it does not have to remember.
+   *
+   * The event log is the evidence, because it is the one place participation is recorded as a
+   * fact rather than inferred: every event carries the actor that caused it.
+   *
+   * Terminal sessions are left out. A completed or cancelled session will never hold a task
+   * again, so naming one as the place to wait is advice that cannot come good, and
+   * `open-session` is the honest answer once everything this agent touched is finished.
+   */
+  participation({ subject }) {
+    if (typeof subject !== 'string' || subject === '') {
+      throw new LedgerError('MALFORMED_ID', 'participation needs a subject to look for');
+    }
+    const rows = [];
+    for (const sessionId of this.listSessions()) {
+      let session;
+      let events;
+      try {
+        session = this.readSession(sessionId);
+        events = this.readEvents(sessionId, { expectSeq: session.eventSeq });
+      } catch (error) {
+        // Unlike `inbox`, an unreadable session is skipped rather than reported as a row: this
+        // answers "where was I", and a session whose log cannot be read is not somewhere an
+        // Agent can be sent to resume. It stays visible on the same recovery path, because
+        // `inbox` does report it — which is where a corrupt session should surface.
+        void error;
+        continue;
+      }
+      if (session.status === 'completed' || session.status === 'cancelled') continue;
+      const mine = events.filter((event) => event.actor === subject);
+      if (!mine.length) continue;
+      rows.push({
+        sessionId,
+        sessionStatus: session.status,
+        lastAt: mine[mine.length - 1].at,
+        lastKind: mine[mine.length - 1].kind,
+        events: mine.length,
+      });
+    }
+    // Newest first, with `sessionId` breaking ties: two sessions touched in the same
+    // millisecond must not order differently on two runs, or the recovery path answers about a
+    // different session depending on how fast the disk was.
+    return rows.sort((a, b) => (a.lastAt === b.lastAt
+      ? a.sessionId.localeCompare(b.sessionId)
+      : (a.lastAt < b.lastAt ? 1 : -1)));
+  }
   // --------------------------------------------------------------------- reviews
 
   reviewsDir(sessionId) {

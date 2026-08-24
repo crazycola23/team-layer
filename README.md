@@ -91,6 +91,24 @@ node scripts/teamctl.mjs doctor --repo .
 
 to verify the binding, identity, role version, and adapter.
 
+## After a lost context
+
+The ledger lives in the Git common directory, so all linked worktrees share one and it survives
+anything that happens to a conversation. One command reads it and answers where an Agent is:
+
+```bash
+node scripts/teamctl.mjs reconcile
+```
+
+It takes no arguments — identity comes from the worktree binding, session and task from the ledger,
+the candidate from `HEAD` — and answers with a status, the session and task, three-valued
+freshness, and a single `nextAction` with the reason that chose it. It exits `0` whatever it finds,
+so "you have a review to address" can never be mistaken for the tool having failed to look.
+
+`node scripts/teamctl.mjs help` lists the rest: sessions and tasks, handoffs, review decisions,
+the task's frozen validation plan, the spec-suite projection, and metrics counted from the sealed
+event log. See [protocol/recovery.md](protocol/recovery.md).
+
 ## Adapter behavior
 
 - **Claude Code:** creates a worktree-local `CLAUDE.local.md` importing the Agent bootstrap.
@@ -107,8 +125,8 @@ tracked `.gitignore`.
 ## What the helper does NOT do
 
 It does not launch Agents, create cloud resources, decide model choice, rewrite shared
-project instructions, implement a second merge gate, or grant capabilities. It exists to
-make identity/bootstrap boring and repeatable.
+project instructions, implement a second merge gate, or grant capabilities. It keeps durable
+state and answers questions about it; every judgment call stays with the Agent or the user.
 
 ## spec-suite
 
@@ -117,12 +135,26 @@ canonical. This skill uses `subject`, `role`, `baseRevision`, `readSet`, and `wr
 adds a team-level semantic `inputs` list for contract digests where useful. The latter must
 not be forced into spec-suite artifacts that do not support it.
 
+There is no capability handshake, so the projection detects what the installed version can carry
+and reports a `compatibility.mode` of `full` or `degraded` alongside the fields it withheld and why.
+`degraded` is today's expected answer: no installed spec-suite carries semantic `inputs`, so
+staleness against a contract revision is enforced in this layer only. That is a named boundary with
+a documented consequence, not a silent omission — see
+[protocol/spec-suite.md](protocol/spec-suite.md).
+
 ## Validate this skill
 
 ```bash
 npm test
+npm run gen:check
 npm run validate
 ```
+
+`gen:check` fails if a generated schema is out of date with the source of truth it was derived
+from. `validate` checks the things a passing test suite cannot: that generated schemas say what
+they were generated from, that every task-packet field has been classified as projectable or not,
+that every action `reconcile` can name is in its precedence list, and that no document tells an
+Agent to run a command the CLI does not have.
 
 The tests use temporary Git repositories and temporary Agent homes; they do not touch your
 real `~/.agent-team` directory.

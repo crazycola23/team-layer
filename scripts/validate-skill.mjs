@@ -398,6 +398,38 @@ for (const capability of Object.values(FIELD_CAPABILITY)) {
 }
 
 /**
+ * A withheld field must be documented as a boundary, not discovered as a silence.
+ *
+ * Withholding `inputs` moves an enforcement point: staleness against a contract revision stops
+ * being checked at the merge gate and is only checked here. That is a defensible trade, and it is
+ * only defensible while somebody can read it — an undocumented one is indistinguishable from
+ * having forgotten the field, and the far side accepts unknown fields silently, so neither layer
+ * would ever complain. So every capability-governed field and the capability that governs it must
+ * be named in the protocol doc, along with the mode a caller is expected to branch on.
+ */
+const specDoc = text('protocol/spec-suite.md');
+for (const [field, capability] of Object.entries(FIELD_CAPABILITY)) {
+  ok(specDoc.includes(`\`${field}\``), `protocol/spec-suite.md never mentions ${field}, whose projection `
+    + `depends on ${capability}: a field withheld without a written consequence reads as an omission`);
+  ok(specDoc.includes(capability), `protocol/spec-suite.md never mentions the capability ${capability}, `
+    + `so a reader cannot tell what withholding ${field} costs them`);
+}
+for (const mode of ['full', 'degraded']) {
+  ok(specDoc.includes(`\`${mode}\``), `protocol/spec-suite.md must document compatibility.mode ${mode}: `
+    + 'it is a status callers are told to refuse on, so it cannot be self-explanatory');
+}
+/**
+ * The reason codes are derived from CAPABILITY_SUPPORT, so adding a support value adds a reason.
+ * Deriving rather than listing is the point: a fourth value would otherwise ship a reason code
+ * that appears in output and in no document.
+ */
+const withheldReasons = ['team-layer-owned', 'not-projectable',
+  ...CAPABILITY_SUPPORT.filter((s) => s !== 'supported').map((s) => `capability-${s}`)];
+for (const reason of withheldReasons) {
+  ok(specDoc.includes(reason), `protocol/spec-suite.md does not document the withheld reason ${reason}`);
+}
+
+/**
  * Every action `reconcile` can name must be in the precedence list.
  *
  * This one is worth an installer-time check because of how the miss behaves: precedence is
@@ -459,6 +491,40 @@ for (const metric of DERIVED_METRICS) {
     `${metric} is both counted by occurrence and summed from a payload, so its value would be neither`);
 }
 ok(new Set(DERIVED_METRICS).size === DERIVED_METRICS.length, 'DERIVED_METRICS names the same metric twice');
+
+/**
+ * A command a document tells an Agent to run must be a command that exists.
+ *
+ * This is the one class of doc drift with teeth. Every other stale sentence costs a reader a
+ * moment; a renamed subcommand costs the Agent that followed [protocol/recovery.md](../protocol/recovery.md)
+ * after losing its context a usage error, at the exact moment it has nothing else to fall back on
+ * and no memory to correct the instruction with. The recovery path is the one that must not have a
+ * typo in it.
+ *
+ * Both halves are checked against different sources on purpose: the first word against the
+ * dispatcher, because that is what decides whether the process runs at all, and the pair against
+ * `usage()`, because a real command with an invented subcommand fails the same way. Line-wrapped
+ * mentions are not matched — this catches renames, not every possible prose form.
+ */
+const teamctlSource = text('scripts/teamctl.mjs');
+const dispatched = new Set([...teamctlSource.matchAll(/command === '([a-z-]+)'/g)].map((m) => m[1]));
+const usageText = teamctlSource.slice(teamctlSource.indexOf('function usage()'));
+ok(dispatched.size > 10, `only ${dispatched.size} teamctl commands were found in the dispatcher, `
+  + 'so the scan is broken and the checks below would pass by finding nothing');
+const docs = ['SKILL.md', 'README.md', 'protocol/recovery.md', 'protocol/review.md',
+  'protocol/spec-suite.md', 'protocol/collaboration.md', 'protocol/core.md', 'protocol/identity.md',
+  'templates/handoff.md', 'examples/three-window-workflow.md',
+  'adapters/claude-code.md', 'adapters/codex.md', 'adapters/gemini-cli.md', 'adapters/generic.md'];
+for (const doc of docs) {
+  if (!fs.existsSync(path.join(ROOT, doc))) continue;
+  for (const [, command, sub] of text(doc).matchAll(/teamctl(?:\.mjs)? +([a-z][a-z-]*)(?: +([a-z][a-z-]*))?/g)) {
+    ok(dispatched.has(command), `${doc} tells an Agent to run "teamctl ${command}", which the CLI does not dispatch`);
+    if (sub) {
+      ok(usageText.includes(`${command} ${sub}`),
+        `${doc} names "teamctl ${command} ${sub}", which teamctl's own usage does not list`);
+    }
+  }
+}
 
 const reviewer = text('roles/reviewer.md');
 ok(/not a second implementer/i.test(reviewer), 'reviewer must remain independent');

@@ -106,6 +106,20 @@ When spec-suite is adopted:
 
 If candidate content/revision changes after Reviewer approval, approval is stale.
 
+"Still has valid approval/evidence" is a question, not a recollection. Ask it about the tree in
+front of you rather than about what you remember agreeing:
+
+```bash
+node scripts/teamctl.mjs validate state --session feature:coupon --task task:coupon-api --gate merge
+node scripts/teamctl.mjs review state   --session feature:coupon --task task:coupon-api
+node scripts/teamctl.mjs reconcile
+```
+
+The first two answer for one dimension each; `reconcile` combines them and only says `integrate`
+when the task is complete, the approval still applies, and the gate is satisfied — and stops saying
+it the moment a commit lands, without anyone having to remember to re-ask. A gate reading `unknown`
+is not a pass: see [review.md](review.md) for the reasons it can give.
+
 ## Parallelism
 
 Parallel work is encouraged only across stable boundaries.
