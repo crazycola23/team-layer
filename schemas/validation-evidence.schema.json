@@ -12,8 +12,10 @@
     "sessionId",
     "taskId",
     "checkId",
+    "checkDigest",
     "candidateRevision",
     "inputSnapshotDigest",
+    "taskFrozenDigest",
     "status",
     "resultDigest",
     "exitCode",
@@ -44,12 +46,20 @@
       "maxLength": 64,
       "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
     },
+    "checkDigest": {
+      "description": "The digest of the check's own frozen definition — its argv or command line, kind, gates and all. `taskFrozenDigest` below already moves when a plan is rewritten, so this adds no detection; what it adds is the reason. Without it, `unit-tests` silently changing from `node --test` to an integration suite is reported the same way as an unrelated acceptance edit, and \"the pass is right there, same checkId\" is the one stale result most likely to be waved through.",
+      "$ref": "digest.schema.json"
+    },
     "candidateRevision": {
       "description": "Exactly what was tested. Any revision scheme, not only git, for the same reason review decisions allow it: plan §13 anticipates naming a work-product digest instead of a commit so that a rebase changing no substance does not discard the result.",
       "$ref": "revision.schema.json"
     },
     "inputSnapshotDigest": {
       "description": "The task's input snapshot at the time of the run. Copied from the frozen task rather than asserted by the runner, so it cannot describe a snapshot the check was not actually run against.",
+      "$ref": "digest.schema.json"
+    },
+    "taskFrozenDigest": {
+      "description": "The digest of the whole frozen task at the time of the run, alongside the input snapshot because they move independently: a reissue that keeps `inputs` and rewrites `acceptance`, `writeSet`, `baseRevision` or `validationPlan` leaves the snapshot exactly where it was. A pass is a claim about the world the check ran in, and most of that world sits outside the snapshot.",
       "$ref": "digest.schema.json"
     },
     "status": { "$ref": "evidence-status.schema.json" },

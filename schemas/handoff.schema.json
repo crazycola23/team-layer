@@ -24,7 +24,7 @@
       "description": "The statement itself: substance only, so that its digest identifies the state being transferred and nothing about the act of transferring it.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["sessionId", "taskId", "from", "to", "inputSnapshotDigest", "nextAction", "summary", "artifacts", "evidence", "unresolved"],
+      "required": ["sessionId", "taskId", "from", "to", "inputSnapshotDigest", "taskFrozenDigest", "nextAction", "summary", "artifacts", "evidence", "unresolved"],
       "properties": {
         "sessionId": { "$ref": "id.schema.json" },
         "taskId": {
@@ -52,6 +52,10 @@
         },
         "inputSnapshotDigest": {
           "description": "The task's input snapshot at publication. Copied from the task rather than asserted by the publisher, so it cannot describe a snapshot the work was not actually done against. Acknowledgement is refused when this no longer matches the task.",
+          "$ref": "digest.schema.json"
+        },
+        "taskFrozenDigest": {
+          "description": "The digest of the whole frozen task at publication, alongside the input snapshot rather than instead of it, because the two move independently. Reissuing a task with the same `inputs` and a different `acceptance`, `writeSet`, `baseRevision` or `validationPlan` leaves the snapshot untouched — so the snapshot alone cannot tell a recipient that the work they are about to start was scoped by a packet that no longer exists. Copied from the task, and acknowledgement is refused when it no longer matches.",
           "$ref": "digest.schema.json"
         },
         "baseRevision": { "$ref": "git-revision.schema.json" },

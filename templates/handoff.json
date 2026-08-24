@@ -1,5 +1,5 @@
 {
-  "$comment": "A handoff draft: what you write, before `teamctl handoff publish --handoff <this>` turns it into a record. The ledger fills in handoffId, seq, from, inputSnapshotDigest, publishedAt, publishedBy and handoffDigest; setting any of them here is refused rather than overridden. See schemas/handoff.schema.json for the stored shape and templates/handoff.md for the same content as prose.",
+  "$comment": "A handoff draft: what you write, before `teamctl handoff publish --handoff <this>` turns it into a record. The ledger fills in handoffId, seq, from, publishedAt, publishedBy and handoffDigest; setting any of them here is refused rather than overridden. inputSnapshotDigest and taskFrozenDigest are also filled in from the task, but you may declare either as an assertion about the task world you worked in, and publication is refused if it has moved since. Declare them when the work took a while: the two move independently, so a task reissued with the same inputs and a new writeSet moves only the second. See schemas/handoff.schema.json for the stored shape and templates/handoff.md for the same content as prose.",
   "sessionId": "feature:coupon",
   "taskId": "task:coupon-api",
   "to": { "role": "reviewer" },

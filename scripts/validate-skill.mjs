@@ -183,7 +183,10 @@ for (const circumstance of ['handoffId', 'seq', 'publishedAt', 'publishedBy', 'h
   ok(!Object.keys(statement?.properties ?? {}).includes(circumstance),
     `${circumstance} is circumstance, not statement; it must sit outside the digested half`);
 }
-for (const field of ['taskId', 'inputSnapshotDigest', 'nextAction', 'summary', 'unresolved']) {
+// Both bindings, because they move independently: a reissue that keeps `inputs` and
+// rewrites `writeSet` leaves the snapshot exactly where it was, and a recipient with
+// only the snapshot to check would start work scoped by a packet that no longer exists.
+for (const field of ['taskId', 'inputSnapshotDigest', 'taskFrozenDigest', 'nextAction', 'summary', 'unresolved']) {
   ok(statement?.required?.includes(field), `a handoff must require ${field}`);
 }
 ok(statement.properties.nextAction?.$ref === 'handoff-action.schema.json',
@@ -225,8 +228,11 @@ for (const circumstance of ['reviewId', 'seq', 'recordedAt', 'recordedBy', 'deci
   ok(!Object.keys(decision?.properties ?? {}).includes(circumstance),
     `${circumstance} is circumstance, not judgement; it must sit outside the digested half`);
 }
-for (const field of ['taskId', 'reviewer', 'candidateRevision', 'inputSnapshotDigest', 'status',
-  'findings', 'summary']) {
+// An approval binds four things, not three: a reviewer judges against `acceptance` and a
+// `writeSet` as much as against the inputs, and Product can rewrite either while leaving
+// `inputs` alone. `taskFrozenDigest` is the coordinate that moves when that happens.
+for (const field of ['taskId', 'reviewer', 'candidateRevision', 'inputSnapshotDigest', 'taskFrozenDigest',
+  'status', 'findings', 'summary']) {
   ok(decision?.required?.includes(field), `a review decision must require ${field}`);
 }
 for (const derived of ['stale', 'applies', 'current', 'isCurrent']) {
@@ -298,9 +304,20 @@ const evidenceSchema = JSON.parse(text('schemas/validation-evidence.schema.json'
 ok(evidenceSchema.additionalProperties === false, 'evidence record must be closed');
 ok(evidenceSchema.properties.recordDigest?.$ref === 'digest.schema.json',
   'recordDigest must $ref digest.schema.json');
-for (const sealed of ['seq', 'evidenceId', 'recordedAt', 'recordedBy', 'status', 'candidateRevision']) {
+for (const sealed of ['seq', 'evidenceId', 'recordedAt', 'recordedBy', 'status', 'candidateRevision',
+  'inputSnapshotDigest', 'taskFrozenDigest', 'checkDigest']) {
   ok(evidenceSchema.required.includes(sealed),
     `an evidence record must require ${sealed}: the seal covers the whole record, so every part of it must be there`);
+}
+// A pass is a claim about one world, and four coordinates locate it. `checkDigest` is
+// the one that is not strictly needed to *detect* a change — `taskFrozenDigest` already
+// moves when a plan is rewritten — but it is the one that supplies the reason, and
+// "same checkId, the pass is right there" is the stale result most likely to be waved
+// through. Required rather than optional so the reason cannot go missing later.
+for (const binding of ['candidateRevision', 'inputSnapshotDigest', 'taskFrozenDigest', 'checkDigest']) {
+  ok(evidenceSchema.properties[binding]?.$ref === 'digest.schema.json'
+    || evidenceSchema.properties[binding]?.$ref === 'revision.schema.json',
+    `${binding} must $ref a shared digest or revision shape rather than inlining a pattern`);
 }
 ok(evidenceSchema.properties.status?.$ref === 'evidence-status.schema.json',
   'evidence status must $ref the generated enum rather than inlining one');

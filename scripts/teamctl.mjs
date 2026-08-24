@@ -859,7 +859,10 @@ function validateCommand(args) {
         const result = runCommandCheck(check, { cwd: repo.root });
         // The snapshot read before the run is asserted on record, so a task restated
         // while a long suite was running is refused rather than credited: the result
-        // describes inputs that are no longer the task's.
+        // describes inputs that are no longer the task's. The frozen digest is asserted
+        // for a sharper version of the same race — `recordEvidence` seals the check
+        // definition it finds inside the lock, so a plan rewritten mid-run would
+        // otherwise seal this result against a check that is not the one that ran.
         records.push(ledger.recordEvidence({
           sessionId,
           taskId,
@@ -867,6 +870,7 @@ function validateCommand(args) {
           candidateRevision,
           result,
           inputSnapshotDigest: task.inputSnapshotDigest,
+          taskFrozenDigest: task.frozenDigest,
         }));
       }
       // The review checks in the selection are reported, not run: nothing here can
@@ -1079,6 +1083,10 @@ function reconcileCommand(args) {
         taskStatus: task?.state.status ?? null,
         generation: task?.state.generation ?? null,
         inputSnapshotDigest: task?.inputSnapshotDigest ?? null,
+        // Both bindings, because both are what handoffs, reviews and evidence are checked
+        // against and they move independently. Reporting only the snapshot would leave an
+        // Agent staring at a stale artifact whose snapshot matches perfectly.
+        taskFrozenDigest: task?.frozenDigest ?? null,
         git: { ...git, target, targetCommit, baseRevision: base, baseIsAncestor },
         inputs,
         candidateRevision,

@@ -109,7 +109,8 @@ const HANDOFF_DERIVED = ['handoffId', 'seq', 'from', 'publishedAt', 'publishedBy
  * `$comment` is allowed so a template can explain itself.
  */
 const HANDOFF_DRAFT_FIELDS = new Set(['$comment', 'sessionId', 'taskId', 'to', 'nextAction',
-  'summary', 'baseRevision', 'artifacts', 'evidence', 'unresolved', 'inputSnapshotDigest']);
+  'summary', 'baseRevision', 'artifacts', 'evidence', 'unresolved', 'inputSnapshotDigest',
+  'taskFrozenDigest']);
 
 /**
  * What a review can conclude (plan §5).
@@ -152,7 +153,8 @@ const REVIEW_DERIVED = ['reviewId', 'seq', 'reviewer', 'recordedAt', 'recordedBy
 
 /** What a review draft may set. Closed for the same reason a handoff draft is. */
 const REVIEW_DRAFT_FIELDS = new Set(['$comment', 'sessionId', 'taskId', 'candidateRevision',
-  'inputSnapshotDigest', 'requirementsRevision', 'status', 'findings', 'validationEvidence', 'summary']);
+  'inputSnapshotDigest', 'taskFrozenDigest', 'requirementsRevision', 'status', 'findings',
+  'validationEvidence', 'summary']);
 
 export const TASK_TRANSITIONS = {
   issued: ['in-progress', 'blocked', 'cancelled'],
@@ -825,6 +827,20 @@ export class Ledger {
             `is now at ${snapshot}. Re-read the task and redo the work against current truth.`,
           { declared: draft.inputSnapshotDigest, current: snapshot, taskId });
       }
+      // The same check against the whole frozen packet rather than only its semantic
+      // inputs, because they move independently: Product can reissue a task with the
+      // same `inputs` and a different `acceptance`, `writeSet`, `baseRevision` or
+      // `validationPlan`. The snapshot does not budge, so the snapshot alone cannot
+      // tell a recipient that the work they are about to act on was scoped by a
+      // packet that no longer exists.
+      const frozenDigest = task.frozenDigest;
+      if (draft.taskFrozenDigest !== undefined && draft.taskFrozenDigest !== frozenDigest) {
+        throw new LedgerError('HANDOFF_STALE',
+          `the draft was produced against task ${taskId} frozen as ${draft.taskFrozenDigest}, which has since ` +
+            `been reissued as ${frozenDigest}. Re-read the task: its acceptance, scope or validation plan ` +
+            'may have changed even though its inputs did not.',
+          { declared: draft.taskFrozenDigest, current: frozenDigest, taskId });
+      }
       const seq = session.handoffSeq + 1;
       const handoffId = `handoff:${actorRole}-to-${toRole}-${seq}`;
       const handoff = {
@@ -833,6 +849,7 @@ export class Ledger {
         from: { subject: actor, role: actorRole },
         to: { role: toRole, ...(draft.to.subject ? { subject: draft.to.subject } : {}) },
         inputSnapshotDigest: snapshot,
+        taskFrozenDigest: frozenDigest,
         ...(draft.baseRevision ? { baseRevision: draft.baseRevision } : {}),
         artifacts: draft.artifacts ?? [],
         evidence: draft.evidence ?? [],
@@ -876,6 +893,7 @@ export class Ledger {
         ...(draft.to.subject ? { toSubject: draft.to.subject } : {}),
         nextAction: handoff.nextAction,
         inputSnapshotDigest: snapshot,
+        taskFrozenDigest: frozenDigest,
         // Counted by §14's `unresolvedRaised`, which is the measurement the plan cares about
         // most: an agent that names what it does not know instead of guessing past it. The
         // count lives on the event rather than being read back off the handoff file, so the
@@ -939,7 +957,7 @@ export class Ledger {
             'Acknowledging it would clear it from the addressee\'s inbox without them ever seeing it.',
           { to, actor, actorRole });
       }
-      const { taskId, inputSnapshotDigest: published } = record.handoff;
+      const { taskId, inputSnapshotDigest: published, taskFrozenDigest: publishedFrozen } = record.handoff;
       const task = this.readTask(sessionId, taskId);
       if (task.inputSnapshotDigest !== published) {
         throw new LedgerError('HANDOFF_STALE',
@@ -947,6 +965,19 @@ export class Ledger {
             `now at ${task.inputSnapshotDigest}. Ask for a fresh handoff rather than starting work ` +
             'against superseded inputs.',
           { published, current: task.inputSnapshotDigest, taskId, generation: task.state.generation });
+      }
+      // The second half of the same question, and the half a snapshot cannot answer.
+      // Reissuing a task with the same `inputs` and a different `acceptance`, `writeSet`,
+      // `baseRevision` or `validationPlan` leaves the snapshot untouched, so a handoff
+      // that passed the check above may still describe work scoped by a packet that no
+      // longer exists. Fails closed on a missing binding too: a handoff that cannot say
+      // which task world it came from is exactly the one worth not starting from.
+      if (publishedFrozen !== task.frozenDigest) {
+        throw new LedgerError('HANDOFF_STALE',
+          `handoff ${handoffId} was published against task ${taskId} frozen as ` +
+            `${publishedFrozen ?? '(unstated)'}, which is now ${task.frozenDigest}. Its inputs are ` +
+            'unchanged, so re-read the task itself: acceptance, scope or validation plan may have moved.',
+          { published: publishedFrozen ?? null, current: task.frozenDigest, taskId, generation: task.state.generation });
       }
       const acked = this.#commit(session, {
         kind: 'handoff-acked',
@@ -956,6 +987,7 @@ export class Ledger {
         taskId,
         generation: task.state.generation,
         inputSnapshotDigest: published,
+        taskFrozenDigest: task.frozenDigest,
         nextAction: record.handoff.nextAction,
       });
       return { acked, handoff: record };
@@ -1011,14 +1043,25 @@ export class Ledger {
           nextAction: h.nextAction,
           summary: h.summary,
           inputSnapshotDigest: h.inputSnapshotDigest,
+          ...(h.taskFrozenDigest ? { taskFrozenDigest: h.taskFrozenDigest } : {}),
           unresolved: h.unresolved.length,
           publishedAt: record.publishedAt,
         };
         try {
           const task = this.readTask(sessionId, h.taskId);
-          row.stale = task.inputSnapshotDigest !== h.inputSnapshotDigest;
+          // Either binding having moved makes the row stale, and they move
+          // independently — a reissue that keeps `inputs` and rewrites `acceptance`
+          // shows up only in the frozen digest. A handoff with no frozen binding at
+          // all cannot be compared, so it reports `null` rather than a `false` that
+          // nothing checked.
+          const inputsMoved = task.inputSnapshotDigest !== h.inputSnapshotDigest;
+          const frozenMoved = h.taskFrozenDigest === undefined
+            ? null
+            : h.taskFrozenDigest !== task.frozenDigest;
+          row.stale = inputsMoved || frozenMoved === true ? true : (frozenMoved === null ? null : false);
           row.taskStatus = task.state.status;
-          if (row.stale) row.currentInputSnapshotDigest = task.inputSnapshotDigest;
+          if (inputsMoved) row.currentInputSnapshotDigest = task.inputSnapshotDigest;
+          if (frozenMoved !== false) row.currentTaskFrozenDigest = task.frozenDigest;
         } catch (error) {
           // Unknown beats false: reporting `stale: false` for a task that cannot
           // be read would be an assertion nothing checked.
@@ -1265,6 +1308,18 @@ export class Ledger {
             `is now at ${snapshot}. Re-read the task and review the candidate against current truth.`,
           { declared: draft.inputSnapshotDigest, current: snapshot, taskId });
       }
+      // And the same refusal against the frozen packet as a whole. A reviewer judges
+      // a candidate against `acceptance` and a `writeSet`, neither of which the input
+      // snapshot covers, so a reissue that leaves `inputs` alone can invalidate a
+      // judgement without moving the digest checked above.
+      const frozenDigest = task.frozenDigest;
+      if (draft.taskFrozenDigest !== undefined && draft.taskFrozenDigest !== frozenDigest) {
+        throw new LedgerError('REVIEW_STALE',
+          `the review was made against task ${taskId} frozen as ${draft.taskFrozenDigest}, which has since ` +
+            `been reissued as ${frozenDigest}. Re-read the task: its acceptance or scope may have changed ` +
+            'even though its inputs did not.',
+          { declared: draft.taskFrozenDigest, current: frozenDigest, taskId });
+      }
       // An approval must name the requirement revision it judged against, and that
       // revision has to be one the task actually declares. Accepting an unchecked
       // string would give the binding the plan requires the *appearance* of being
@@ -1333,6 +1388,7 @@ export class Ledger {
         reviewer: { subject: actor, role: actorRole },
         candidateRevision: draft.candidateRevision,
         inputSnapshotDigest: snapshot,
+        taskFrozenDigest: frozenDigest,
         ...(draft.requirementsRevision ? { requirementsRevision: draft.requirementsRevision } : {}),
         status: draft.status,
         findings,
@@ -1367,6 +1423,7 @@ export class Ledger {
         status: decision.status,
         candidateRevision: decision.candidateRevision,
         inputSnapshotDigest: snapshot,
+        taskFrozenDigest: frozenDigest,
         findings: decision.findings.length,
         unresolved: unresolved.length,
         decisionDigest: record.decisionDigest,
@@ -1395,7 +1452,11 @@ export class Ledger {
     if (candidateRevision !== null) assertRevision(candidateRevision, 'candidateRevision');
     const task = this.readTask(sessionId, taskId);
     const decisions = this.listReviews(sessionId).filter((r) => r.decision.taskId === taskId);
-    const current = { inputSnapshotDigest: task.inputSnapshotDigest, candidateRevision };
+    const current = {
+      inputSnapshotDigest: task.inputSnapshotDigest,
+      taskFrozenDigest: task.frozenDigest,
+      candidateRevision,
+    };
     const latest = decisions.at(-1);
     if (!latest) {
       return {
@@ -1406,10 +1467,20 @@ export class Ledger {
     }
     const d = latest.decision;
     const reasons = [];
+    // A judgement applies only to the exact task world it was made in, and that world
+    // has two independent coordinates. `inputs-moved` catches a changed contract
+    // revision; `task-reissued` catches everything else Product can rewrite —
+    // acceptance, writeSet, baseRevision, validationPlan — none of which the input
+    // snapshot sees. A decision that states no frozen binding at all cannot be placed
+    // in either world, so it reports unknown rather than a pass.
+    let unknownBinding = false;
+    if (d.taskFrozenDigest === undefined) unknownBinding = true;
+    else if (d.taskFrozenDigest !== task.frozenDigest) reasons.push('task-reissued');
     if (d.inputSnapshotDigest !== task.inputSnapshotDigest) reasons.push('inputs-moved');
     if (candidateRevision !== null && d.candidateRevision !== candidateRevision) reasons.push('candidate-moved');
     let applies;
     if (reasons.length) applies = false;
+    else if (unknownBinding) { applies = null; reasons.push('task-binding-unknown'); }
     else if (candidateRevision === null) { applies = null; reasons.push('candidate-unknown'); }
     else applies = true;
     return {
@@ -1426,6 +1497,7 @@ export class Ledger {
       observed: {
         candidateRevision: d.candidateRevision,
         inputSnapshotDigest: d.inputSnapshotDigest,
+        taskFrozenDigest: d.taskFrozenDigest ?? null,
         requirementsRevision: d.requirementsRevision ?? null,
       },
       current,
@@ -1498,7 +1570,7 @@ export class Ledger {
    * Recording evidence moves neither the task nor the session, for the same reason
    * recording a review does not: it is an input to a gate, not the gate.
    */
-  recordEvidence({ sessionId, taskId, checkId, candidateRevision, result, inputSnapshotDigest = undefined, actor = this.actor }) {
+  recordEvidence({ sessionId, taskId, checkId, candidateRevision, result, inputSnapshotDigest = undefined, taskFrozenDigest = undefined, actor = this.actor }) {
     assertId(sessionId, 'sessionId');
     assertId(taskId, 'taskId');
     assertRevision(candidateRevision, 'candidateRevision');
@@ -1554,6 +1626,16 @@ export class Ledger {
             + `${snapshot}. Re-read the task and rerun the check against current truth.`,
           { declared: inputSnapshotDigest, current: snapshot, taskId });
       }
+      // The frozen packet as a whole, for the same reason a review binds it: a pass is
+      // a claim about the world the check was run in, and most of that world — the
+      // check's own definition included — sits outside the input snapshot.
+      const frozenDigest = task.frozenDigest;
+      if (taskFrozenDigest !== undefined && taskFrozenDigest !== frozenDigest) {
+        throw new LedgerError('EVIDENCE_STALE',
+          `the check was run against task ${taskId} frozen as ${taskFrozenDigest}, which has since been `
+            + `reissued as ${frozenDigest}. Re-read the task and rerun: the check itself may have changed.`,
+          { declared: taskFrozenDigest, current: frozenDigest, taskId });
+      }
 
       const seq = (session.evidenceSeq ?? 0) + 1;
       const evidenceId = `evidence:${checkId}-${seq}`;
@@ -1570,8 +1652,17 @@ export class Ledger {
         sessionId,
         taskId,
         checkId,
+        // The check's own frozen definition, named separately from the packet that
+        // holds it. `taskFrozenDigest` already moves when a plan is rewritten, so this
+        // adds no detection — it adds the *reason*: a gate can say `check-changed`
+        // instead of `task-reissued` when `unit-tests` quietly stops being
+        // `node --test` and starts being an integration suite. Without it, the one
+        // failure mode most likely to be waved through — "the pass is right there,
+        // same checkId" — reads identically to an unrelated acceptance edit.
+        checkDigest: jsonDigest(check),
         candidateRevision,
         inputSnapshotDigest: snapshot,
+        taskFrozenDigest: frozenDigest,
         status: result.status,
         resultDigest: result.resultDigest,
         exitCode: result.exitCode ?? null,
@@ -1596,6 +1687,8 @@ export class Ledger {
         status: record.status,
         candidateRevision,
         inputSnapshotDigest: snapshot,
+        taskFrozenDigest: frozenDigest,
+        checkDigest: record.checkDigest,
         exitCode: record.exitCode,
         resultDigest: record.resultDigest,
       });
@@ -1628,11 +1721,15 @@ export class Ledger {
     }
     if (candidateRevision !== null) assertRevision(candidateRevision, 'candidateRevision');
     const task = this.readTask(sessionId, taskId);
-    const current = { candidateRevision, inputSnapshotDigest: task.inputSnapshotDigest };
+    const current = {
+      candidateRevision,
+      inputSnapshotDigest: task.inputSnapshotDigest,
+      taskFrozenDigest: task.frozenDigest,
+    };
     const required = checksRequiredAt(task.frozen.validationPlan ?? [], gate);
     const checks = required.map((check) => (check.kind === 'review'
       ? this.#reviewCheckState(sessionId, taskId, check, candidateRevision)
-      : this.#commandCheckState(sessionId, taskId, check, candidateRevision, task.inputSnapshotDigest)));
+      : this.#commandCheckState(sessionId, taskId, check, candidateRevision, task)));
     // A gate with no checks is an authoring decision, not an oversight: the plan must
     // declare at least one check and every check at least one gate, so an empty gate
     // means this task genuinely asks for nothing here. Reported as `passed` with the
@@ -1657,7 +1754,7 @@ export class Ledger {
     };
   }
 
-  #commandCheckState(sessionId, taskId, check, candidateRevision, snapshot) {
+  #commandCheckState(sessionId, taskId, check, candidateRevision, task) {
     const history = this.listEvidence(sessionId, { taskId, checkId: check.checkId });
     const latest = history.at(-1);
     const base = { checkId: check.checkId, kind: check.kind, runs: history.length };
@@ -1665,7 +1762,16 @@ export class Ledger {
       return { ...base, status: 'unknown', reasons: ['no-evidence'], evidenceId: null, observed: null };
     }
     const reasons = [];
-    if (latest.inputSnapshotDigest !== snapshot) reasons.push('inputs-moved');
+    // Four independent ways a past run can stop describing the present, and no one of
+    // them implies another. The two digest checks are what stop the most tempting reuse
+    // of all: `unit-tests` passed, `unit-tests` is still required, and in between
+    // somebody changed what `unit-tests` runs.
+    const checkDigest = jsonDigest(check);
+    if (latest.taskFrozenDigest === undefined) reasons.push('task-binding-unknown');
+    else if (latest.taskFrozenDigest !== task.frozenDigest) reasons.push('task-reissued');
+    if (latest.checkDigest === undefined) reasons.push('check-binding-unknown');
+    else if (latest.checkDigest !== checkDigest) reasons.push('check-changed');
+    if (latest.inputSnapshotDigest !== task.inputSnapshotDigest) reasons.push('inputs-moved');
     if (candidateRevision !== null && latest.candidateRevision !== candidateRevision) reasons.push('candidate-moved');
     if (candidateRevision === null) reasons.push('candidate-unknown');
     // `errored` is a reason the check told us nothing, not a verdict on the code —
@@ -1684,10 +1790,13 @@ export class Ledger {
         status: latest.status,
         candidateRevision: latest.candidateRevision,
         inputSnapshotDigest: latest.inputSnapshotDigest,
+        taskFrozenDigest: latest.taskFrozenDigest ?? null,
+        checkDigest: latest.checkDigest ?? null,
         exitCode: latest.exitCode,
         recordedAt: latest.recordedAt,
         recordedBy: latest.recordedBy,
       },
+      current: { taskFrozenDigest: task.frozenDigest, checkDigest },
     };
   }
 

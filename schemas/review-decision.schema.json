@@ -24,7 +24,7 @@
       "description": "The judgement itself: substance only, so its digest identifies what was decided and nothing about the act of recording it.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["sessionId", "taskId", "reviewer", "candidateRevision", "inputSnapshotDigest", "status", "findings", "validationEvidence", "summary"],
+      "required": ["sessionId", "taskId", "reviewer", "candidateRevision", "inputSnapshotDigest", "taskFrozenDigest", "status", "findings", "validationEvidence", "summary"],
       "properties": {
         "sessionId": { "$ref": "id.schema.json" },
         "taskId": { "$ref": "id.schema.json" },
@@ -44,6 +44,10 @@
         },
         "inputSnapshotDigest": {
           "description": "The task's input snapshot at review time. Copied from the task rather than asserted by the reviewer, so it cannot describe a snapshot the review was not actually made against.",
+          "$ref": "digest.schema.json"
+        },
+        "taskFrozenDigest": {
+          "description": "The digest of the whole frozen task the judgement was made against. The input snapshot above covers only the semantic inputs; a reviewer judges a candidate against `acceptance` and a `writeSet` as well, and Product can rewrite either while leaving `inputs` alone. Both bindings are therefore checked when deciding whether the decision still applies, and a reissue moves this one even when the snapshot does not.",
           "$ref": "digest.schema.json"
         },
         "requirementsRevision": {

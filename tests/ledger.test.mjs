@@ -626,6 +626,28 @@ test('publishing against a snapshot the task has already moved past is refused',
   assert.deepEqual(ledger.listHandoffs(sessionId), []);
 });
 
+test('publishing against a packet the task has already replaced is refused', () => {
+  const { ledger, sessionId } = taskedSession();
+  const stale = ledger.readTask(sessionId, 'task:coupon').frozenDigest;
+  const inputs = ledger.readTask(sessionId, 'task:coupon').inputSnapshotDigest;
+  // Declaring the packet you worked against is honoured while it is still the packet.
+  assert.equal(code(() => ledger.publishHandoff({
+    sessionId, actorRole: 'fullstack', draft: draft({ taskFrozenDigest: stale }),
+  })), null);
+
+  ledger.reissueTask({
+    sessionId, reason: 'the coupon rule moves to the pricing module',
+    packet: packet({ writeSet: ['src/pricing/**'] }),
+  });
+  assert.equal(ledger.readTask(sessionId, 'task:coupon').inputSnapshotDigest, inputs,
+    'the inputs genuinely did not move, so the snapshot check cannot be what catches this');
+
+  assert.equal(code(() => ledger.publishHandoff({
+    sessionId, actorRole: 'fullstack', draft: draft({ taskFrozenDigest: stale }),
+  })), 'HANDOFF_STALE');
+  assert.equal(ledger.listHandoffs(sessionId).length, 1, 'nothing refused was written');
+});
+
 test('editing a published handoff on disk is detected instead of obeyed', () => {
   const { ledger, sessionId } = taskedSession();
   const record = ledger.publishHandoff({ sessionId, draft: draft(), actorRole: 'fullstack' });
@@ -1052,15 +1074,19 @@ test('an approval stops applying when the candidate or the inputs move', () => {
   assert.deepEqual([unknown.applies, unknown.reasons], [null, ['candidate-unknown']]);
 
   // Inputs moving is known regardless of which candidate is being asked about, so it
-  // is false rather than null even with no candidate.
+  // is false rather than null even with no candidate. Both bindings move here, because
+  // changing the inputs means reissuing the packet that holds them — the interesting
+  // case is the reverse one, a reissue the snapshot cannot see, and it has a test of
+  // its own below.
   ledger.reissueTask({
     sessionId, reason: 'coupon contract v2',
     packet: packet({ inputs: [{ id: 'contract:coupon', revision: `sha256:${'9'.repeat(64)}`, authority: 'product-architect' }] }),
   });
-  assert.deepEqual(state().reasons, ['inputs-moved']);
+  assert.deepEqual(state().reasons, ['task-reissued', 'inputs-moved']);
   assert.equal(state().applies, false);
-  assert.deepEqual(state({ candidateRevision: 'git:aaaaaaa' }).reasons, ['inputs-moved']);
-  assert.deepEqual(state({ candidateRevision: 'git:bbbbbbb' }).reasons, ['inputs-moved', 'candidate-moved']);
+  assert.deepEqual(state({ candidateRevision: 'git:aaaaaaa' }).reasons, ['task-reissued', 'inputs-moved']);
+  assert.deepEqual(state({ candidateRevision: 'git:bbbbbbb' }).reasons,
+    ['task-reissued', 'inputs-moved', 'candidate-moved']);
 
   // The latest decision is the one that answers, and it can restore applicability.
   review(ledger, sessionId, decision({
@@ -1092,6 +1118,99 @@ test('a review declaring a snapshot the task has moved past is refused', () => {
     inputSnapshotDigest: stale, requirementsRevision: `sha256:${'9'.repeat(64)}`,
   }))), 'REVIEW_STALE');
   assert.equal(ledger.listReviews(sessionId).length, 1);
+});
+
+test('a review declaring a packet the task has replaced is refused', () => {
+  const { ledger, sessionId } = taskedSession();
+  const stale = ledger.readTask(sessionId, 'task:coupon').frozenDigest;
+  assert.equal(code(() => review(ledger, sessionId, decision({ taskFrozenDigest: stale }))), null);
+
+  // Acceptance moves; the contract does not. The snapshot check above is blind to this,
+  // and a reviewer who read AC-1 and came back after AC-2 landed would otherwise have a
+  // judgement about the old standard filed as a judgement about the new one.
+  ledger.reissueTask({
+    sessionId, reason: 'AC-2 added: the discount must survive a partial refund',
+    packet: packet({ acceptance: ['AC-1', 'AC-2'] }),
+  });
+  assert.equal(code(() => review(ledger, sessionId, decision({ taskFrozenDigest: stale }))), 'REVIEW_STALE');
+  assert.equal(ledger.listReviews(sessionId).length, 1, 'nothing refused was written');
+  assert.equal(code(() => review(ledger, sessionId, decision())), null, 'and re-reading the task clears it');
+});
+
+/**
+ * The reissue the input snapshot cannot see, which is the whole reason
+ * `taskFrozenDigest` exists.
+ *
+ * Everything a reviewer actually judges — `acceptance`, and the `writeSet` that says
+ * where the answer was allowed to live — sits outside the semantic input set. Product
+ * can therefore rewrite the standard the candidate is held to while `inputs` stays
+ * byte-identical, and before this binding the approval kept reading `applies: true`:
+ * same contract revision, same commit, so nothing the gate compared had moved. The
+ * reviewer had approved AC-1 alone and the task now demands AC-2 as well.
+ */
+test('an approval stops applying when the task is reissued around unchanged inputs', () => {
+  const { ledger, sessionId } = startedSession();
+  ledger.issueTask({ sessionId, packet: mixedPacket() });
+  const inputs = ledger.readTask(sessionId, 'task:coupon').inputSnapshotDigest;
+  review(ledger, sessionId, decision());
+  const before = ledger.reviewStateFor(sessionId, 'task:coupon', { candidateRevision: 'git:def5678' });
+  assert.deepEqual([before.applies, before.reasons], [true, []]);
+
+  ledger.reissueTask({
+    sessionId, reason: 'AC-2 added: the discount must survive a partial refund',
+    packet: mixedPacket({ acceptance: ['AC-1', 'AC-2'] }),
+  });
+  const task = ledger.readTask(sessionId, 'task:coupon');
+  assert.equal(task.inputSnapshotDigest, inputs, 'the inputs genuinely did not move');
+
+  const after = ledger.reviewStateFor(sessionId, 'task:coupon', { candidateRevision: 'git:def5678' });
+  assert.deepEqual([after.applies, after.reasons], [false, ['task-reissued']],
+    'the only thing that moved is the frozen packet, and that is enough');
+  assert.deepEqual([after.observed.taskFrozenDigest, after.current.taskFrozenDigest],
+    [before.observed.taskFrozenDigest, task.frozenDigest], 'it names both worlds, so the fix is obvious');
+  assert.notEqual(after.observed.taskFrozenDigest, after.current.taskFrozenDigest);
+
+  // And the merge gate inherits that answer rather than deciding again — one place
+  // derives applicability, so the gate and `review state` cannot drift apart. Unknown,
+  // not failed: somebody did approve this candidate, and the missing thing is a
+  // judgement against the standard the task now sets.
+  const gate = ledger.validationStateFor(sessionId, 'task:coupon',
+    { gate: 'merge', candidateRevision: 'git:def5678' });
+  const peer = gate.checks.find((c) => c.checkId === 'peer-review');
+  assert.deepEqual([gate.status, peer.status, peer.reasons], ['unknown', 'unknown', ['task-reissued']]);
+});
+
+/**
+ * The same reissue seen from the other artifact: a scope change, and a handoff that
+ * described work done under the old scope.
+ *
+ * `writeSet` is the sentence "the answer belongs in these paths". Narrowing it does not
+ * touch `inputs`, so the published handoff still passed its snapshot check while
+ * describing files the task no longer permits. `inbox` has to say so before the ack
+ * rather than by refusing it: the recipient is about to start, and a refusal at that
+ * point is the discovery arriving one step too late.
+ */
+test('a scope change makes a published handoff stale before it can be acknowledged', () => {
+  const { ledger, sessionId } = taskedSession();
+  const record = ledger.publishHandoff({ sessionId, draft: draft(), actorRole: 'fullstack' });
+  const inputs = ledger.readTask(sessionId, 'task:coupon').inputSnapshotDigest;
+  assert.equal(record.handoff.taskFrozenDigest, ledger.readTask(sessionId, 'task:coupon').frozenDigest);
+  assert.equal(ledger.inbox({ role: 'reviewer' })[0].stale, false);
+
+  ledger.reissueTask({
+    sessionId, reason: 'the coupon rule moves to the pricing module',
+    packet: packet({ writeSet: ['src/pricing/**'], baseRevision: 'git:9999999' }),
+  });
+  const task = ledger.readTask(sessionId, 'task:coupon');
+  assert.equal(task.inputSnapshotDigest, inputs, 'the inputs genuinely did not move');
+
+  const row = ledger.inbox({ role: 'reviewer' })[0];
+  assert.equal(row.stale, true, 'the row warns before the recipient commits to the work');
+  assert.equal(row.currentTaskFrozenDigest, task.frozenDigest);
+  assert.equal(row.currentInputSnapshotDigest, undefined, 'and does not blame the inputs, which held');
+  assert.equal(code(() => ledger.ackHandoff({
+    sessionId, handoffId: record.handoffId, actor: 'agent:reviewer-01', actorRole: 'reviewer',
+  })), 'HANDOFF_STALE');
 });
 
 test('the shipped review template records against the shipped task packet', () => {
@@ -1299,6 +1418,136 @@ test('evidence run against inputs the task has moved past is refused', () => {
   // Declaring it stays optional, because the ledger copies the current snapshot anyway.
   // What the declaration buys is the refusal above.
   assert.equal(code(() => evidence(ledger, sessionId)), null);
+});
+
+/**
+ * The reissue a passing test cannot see, and the one most likely to be waved through.
+ *
+ * `validationPlan` is part of the frozen packet but not part of the input snapshot, so
+ * rewriting a check leaves both digests the old gate compared exactly where they were:
+ * same contract revision, same commit, evidence right there saying `passed`. The pass
+ * was a measurement of the old plan. Nothing about the candidate changed — the standard
+ * did — which is why the gate reads `unknown` and not `failed`.
+ *
+ * Two reasons rather than one, because "the packet moved" and "this check moved" call
+ * for different next steps, and the second is the one a reader will otherwise argue
+ * with: the checkId is unchanged, so the stale pass looks addressed to the new check.
+ */
+test('a rewritten check makes its own passing evidence unusable, candidate unmoved', () => {
+  const { ledger, sessionId } = taskedSession();
+  const gate = () => ledger.validationStateFor(sessionId, 'task:coupon',
+    { gate: 'merge', candidateRevision: 'git:def5678' });
+  const recorded = evidence(ledger, sessionId);
+  const inputs = ledger.readTask(sessionId, 'task:coupon').inputSnapshotDigest;
+  assert.equal(gate().status, 'passed');
+
+  // Same checkId, same kind, same gates. Only what it runs is different — which is
+  // exactly the edit that used to inherit the old green.
+  ledger.reissueTask({
+    sessionId, reason: 'unit tests were not covering the integration path',
+    packet: packet({
+      validationPlan: [{
+        checkId: 'unit-tests', kind: 'command', requiredAt: ['handoff', 'merge'],
+        argv: ['node', '--test', 'tests/integration/'],
+      }],
+    }),
+  });
+  const task = ledger.readTask(sessionId, 'task:coupon');
+  assert.equal(task.inputSnapshotDigest, inputs, 'the inputs genuinely did not move');
+
+  const after = gate();
+  assert.equal(after.status, 'unknown', 'the pass is not reusable, and the work is not condemned either');
+  assert.deepEqual(after.checks[0].reasons, ['task-reissued', 'check-changed']);
+  assert.equal(after.checks[0].evidenceId, recorded.evidenceId, 'it still names the run it declined to credit');
+  assert.equal(after.checks[0].observed.status, 'passed');
+  assert.equal(after.checks[0].observed.checkDigest, recorded.checkDigest);
+  assert.notEqual(after.checks[0].current.checkDigest, recorded.checkDigest);
+
+  // Rerunning against the new plan restores the gate. The remedy is a rerun, which is
+  // cheap; there is deliberately no way to re-credit the old record.
+  evidence(ledger, sessionId);
+  assert.equal(gate().status, 'passed');
+});
+
+/**
+ * The same refusal at record time, for the runner that read the task, ran the check,
+ * and came back into a reissued world.
+ *
+ * Optional to declare, like the snapshot beside it, because the ledger copies the
+ * current digest either way. What declaring buys is this refusal: without it the run
+ * would be sealed against a packet it never saw and would read, permanently, as a
+ * measurement of the new plan.
+ */
+test('evidence run against a task that has since been reissued is refused', () => {
+  const { ledger, sessionId } = taskedSession();
+  const stale = ledger.readTask(sessionId, 'task:coupon').frozenDigest;
+  assert.equal(code(() => evidence(ledger, sessionId, { taskFrozenDigest: stale })), null);
+
+  ledger.reissueTask({
+    sessionId, reason: 'AC-2 added',
+    packet: packet({ acceptance: ['AC-1', 'AC-2'] }),
+  });
+  assert.equal(code(() => evidence(ledger, sessionId, { taskFrozenDigest: stale })), 'EVIDENCE_STALE');
+  assert.equal(ledger.listEvidence(sessionId).length, 1, 'nothing refused was written');
+  assert.equal(code(() => evidence(ledger, sessionId)), null);
+});
+
+/**
+ * The three artifacts are read back by code that must cope with records written before
+ * these bindings existed, and reads verify seals rather than schemas — so an older file
+ * loads fine and simply cannot answer the question.
+ *
+ * The answer to a question that cannot be asked is `unknown`, never a match. Treating a
+ * missing binding as agreement is the one behaviour that would make adding the binding
+ * pointless: every artifact predating it would keep sailing through the gate, which is
+ * exactly the population most likely to be stale. `unknown` is not a lenient pass either
+ * — the gate refuses on it — so the cost of the strict reading is a rerun, and the cost
+ * of the lenient one is a merge nobody checked.
+ *
+ * Each record is re-sealed after the field is removed, because an unsealed one would be
+ * refused as tampered and would prove only that the seal works.
+ */
+test('an artifact written before these bindings existed reports unknown, not a match', () => {
+  const { ledger, sessionId } = startedSession();
+  ledger.issueTask({ sessionId, packet: mixedPacket() });
+  const strip = (file, half, digestKey, field) => {
+    const stored = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const body = half === null ? stored : stored[half];
+    delete body[field];
+    if (half === null) delete body[digestKey];
+    fs.writeFileSync(file, JSON.stringify(half === null
+      ? { ...body, [digestKey]: jsonDigest(body) }
+      : { ...stored, [half]: body, [digestKey]: jsonDigest(body) }));
+  };
+
+  const handoff = ledger.publishHandoff({ sessionId, draft: draft(), actorRole: 'fullstack' });
+  assert.equal(ledger.inbox({ role: 'reviewer' })[0].stale, false);
+  strip(ledger.handoffFile(sessionId, handoff.handoffId), 'handoff', 'handoffDigest', 'taskFrozenDigest');
+  const row = ledger.inbox({ role: 'reviewer' })[0];
+  assert.equal(row.stale, null, 'not false: nothing compared the packet, so nothing established freshness');
+  assert.equal(row.taskFrozenDigest, undefined);
+  assert.equal(row.currentTaskFrozenDigest, ledger.readTask(sessionId, 'task:coupon').frozenDigest,
+    'and it still names the packet the row should have been compared against');
+
+  const decided = review(ledger, sessionId, decision());
+  const state = () => ledger.reviewStateFor(sessionId, 'task:coupon', { candidateRevision: 'git:def5678' });
+  assert.deepEqual([state().applies, state().reasons], [true, []]);
+  strip(ledger.reviewFile(sessionId, decided.reviewId), 'decision', 'decisionDigest', 'taskFrozenDigest');
+  assert.deepEqual([state().applies, state().reasons], [null, ['task-binding-unknown']]);
+  assert.equal(state().observed.taskFrozenDigest, null);
+
+  const recorded = evidence(ledger, sessionId);
+  const gate = () => ledger.validationStateFor(sessionId, 'task:coupon',
+    { gate: 'merge', candidateRevision: 'git:def5678' });
+  assert.equal(gate().checks.find((c) => c.checkId === 'unit-tests').status, 'passed');
+  strip(ledger.evidenceFile(sessionId, recorded.evidenceId), null, 'recordDigest', 'checkDigest');
+  const unit = gate().checks.find((c) => c.checkId === 'unit-tests');
+  assert.deepEqual([unit.status, unit.reasons], ['unknown', ['check-binding-unknown']]);
+  assert.equal(unit.observed.checkDigest, null);
+  assert.equal(unit.observed.status, 'passed', 'the run is still reported honestly; it is just not credited');
+
+  // And the gate as a whole refuses, which is what makes the strict reading worth having.
+  assert.equal(gate().status, 'unknown');
 });
 
 test('evidence is listable by task and by check, in the order it was recorded', () => {
