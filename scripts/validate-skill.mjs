@@ -9,6 +9,7 @@ import {
   FIELD_CAPABILITY, detectCapabilities, probeCapabilities,
 } from '../src/spec-suite.mjs';
 import { NEXT_ACTIONS, RECONCILE_STATUSES } from '../src/reconcile.mjs';
+import { SEMANTIC_ESTABLISHED_NEGATIVE, SEMANTIC_UNESTABLISHED } from '../src/integration.mjs';
 import { METRIC_SOURCES, DERIVED_METRICS, UNAVAILABLE_METRICS } from '../src/metrics.mjs';
 import { VALIDATION_KINDS, RUNNABLE_KINDS } from '../src/validation.mjs';
 import { loadSchema, validate } from '../src/schema.mjs';
@@ -38,7 +39,7 @@ const required = [
   'templates/handoff.md', 'templates/handoff.json', 'templates/task-packet.json', 'templates/finding.json',
   'templates/review-decision.json',
   'scripts/teamctl.mjs', 'src/ledger.mjs', 'src/slug.mjs', 'src/digest.mjs', 'src/schema.mjs',
-  'src/validation.mjs', 'src/spec-suite.mjs', 'src/reconcile.mjs', 'src/metrics.mjs'
+  'src/validation.mjs', 'src/spec-suite.mjs', 'src/reconcile.mjs', 'src/integration.mjs', 'src/metrics.mjs'
 ];
 for (const file of required) ok(fs.existsSync(path.join(ROOT, file)), `missing ${file}`);
 
@@ -583,6 +584,36 @@ for (const [, status, action] of reconcileSource.matchAll(/(?:finding|answer)\(\
 ok(namedPairs >= NEXT_ACTIONS.length, `reconcile only names ${namedPairs} status/action pairs, `
   + `fewer than the ${NEXT_ACTIONS.length} actions it declares: either an action is unreachable or the scan missed a call site`);
 ok(new Set(NEXT_ACTIONS).size === NEXT_ACTIONS.length, 'NEXT_ACTIONS has a duplicate, so its precedence is ambiguous');
+
+/**
+ * Every reconcile action must be classified as a verdict or as an absence of one.
+ *
+ * `semanticVerdict` turns reconcile's answer into the value spec-suite's hook reads, and the
+ * default for an action it does not recognise is `unknown` — which is the safe direction, so the
+ * miss is silent. That is the problem: adding a next action that means "the code is wrong" and
+ * forgetting to list it would report the candidate as merely unestablished, and a human reading
+ * the report would go looking for a check to run instead of a defect to fix. The two lists are
+ * required to partition `NEXT_ACTIONS` exactly, so a new action cannot be added without deciding
+ * which kind it is. `integrate` is in neither: it is the pass, and it is read from the action
+ * itself rather than from a list.
+ */
+const classifiedActions = [...SEMANTIC_ESTABLISHED_NEGATIVE, ...SEMANTIC_UNESTABLISHED];
+ok(new Set(classifiedActions).size === classifiedActions.length,
+  'an action appears in both SEMANTIC_ESTABLISHED_NEGATIVE and SEMANTIC_UNESTABLISHED, '
+  + 'so whether it is a finding about the candidate depends on which list is consulted first');
+for (const action of classifiedActions) {
+  ok(NEXT_ACTIONS.includes(action),
+    `src/integration.mjs classifies ${action}, which is not in NEXT_ACTIONS: it classifies nothing`);
+}
+for (const action of NEXT_ACTIONS) {
+  if (action === 'integrate') continue;
+  ok(classifiedActions.includes(action), `the reconcile action ${action} is in neither `
+    + 'SEMANTIC_ESTABLISHED_NEGATIVE nor SEMANTIC_UNESTABLISHED, so validate-candidate would report it as '
+    + 'unknown by default — decide whether it is a finding about the candidate or the absence of one');
+}
+ok(!classifiedActions.includes('integrate'),
+  'integrate must not be classified: it is the pass, and listing it as a negative or as unestablished '
+  + 'would make the one action that means yes unreachable');
 
 /**
  * Every counted metric must be wired to an event kind something actually emits.

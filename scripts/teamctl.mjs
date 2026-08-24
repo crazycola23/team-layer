@@ -14,6 +14,10 @@ import {
 } from '../src/validation.mjs';
 import { detectCapabilities, projectSpecTask, SPEC_SUITE_CAPABILITIES } from '../src/spec-suite.mjs';
 import { gitFreshness, inputsFreshness, decide, NEXT_ACTIONS, RECONCILE_STATUSES } from '../src/reconcile.mjs';
+import {
+  INTEGRATION_PHASES, INTEGRATION_STATUSES, PHASE_GATES,
+  semanticVerdict, structuralVerdict, composeIntegration,
+} from '../src/integration.mjs';
 import { collectMetrics } from '../src/metrics.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -980,6 +984,95 @@ function currentTask(ledger, subject, args) {
 }
 
 /**
+ * What both recovery commands look at, gathered once.
+ *
+ * `reconcile` and `validate-candidate` answer two different questions about the same situation —
+ * "what should this agent do next" and "may this candidate be integrated" — and the one thing
+ * they must never do is disagree about the situation itself. Two copies of this block is how one
+ * command starts reporting a review as applicable while the other calls it superseded, and the
+ * Agent that believes the wrong one has no third opinion to consult. So the observation is made
+ * in one place and the two commands differ only in what they conclude from it.
+ *
+ * `gates` is a function of the task rather than a list, because the gate `reconcile` asks about
+ * is derived from the task's own status (see `gateFor`) while a validation phase's gates are
+ * fixed by the phase.
+ */
+function observe({ repo, ledger, binding, args, gates }) {
+  const subject = binding ? `agent:${binding.agentId}` : null;
+  const found = binding ? currentTask(ledger, subject, args) : null;
+  // Mail is read before the session is settled, because for a reviewer it is the only thing
+  // that names one: handoffs are addressed to a role, and a reviewer never holds a task of its
+  // own. `ledger.inbox` scans every session and tolerates one it cannot read, which is what
+  // makes it usable this early — and its unreadable rows are dropped here rather than used to
+  // resolve a session, because reading one would throw and turn a single corrupt session
+  // anywhere in the home into a refusal for every agent, which is the tolerance it exists for.
+  const rows = binding ? ledger.inbox({ role: binding.role, subject }) : [];
+  const waiting = rows.filter((row) => !row.unreadable);
+  const unreadable = rows.filter((row) => row.unreadable);
+  // A session named on the command line is read even when it holds no task for this agent, so
+  // the answer can be `await-task`. Without the flag a session is reachable three ways, in
+  // descending order of how much it says about what to do now: a task addressed to this agent,
+  // mail addressed to it, and — last — a session it has acted in before. Answering
+  // `open-session` to an Agent whose session already exists sends it into a collision it
+  // cannot act on from there, so the last fallback matters even though it names no work:
+  // `await-task` in the session you were in is the honest answer, and `participation` is what
+  // makes it reachable for a reviewer that has already acknowledged its mail.
+  const named = typeof args.session === 'string' && args.session !== '' ? args.session : null;
+  const revisited = binding && !found && !named && !waiting.length
+    ? ledger.participation({ subject })[0]?.sessionId ?? null
+    : null;
+  const session = found?.session
+    ?? (named && ledger.listSessions().includes(named) ? ledger.readSession(named) : null)
+    ?? (waiting.length ? ledger.readSession(waiting[0].sessionId) : null)
+    ?? (revisited ? ledger.readSession(revisited) : null);
+  const task = found?.task ?? null;
+
+  const target = session?.integrationTarget ?? null;
+  // The inbox tolerates a session whose event log cannot be read, because one corrupt session
+  // must not hide every other session's mail. Reconcile cannot afford the same tolerance: this
+  // is the only session it is answering about, and "no unacknowledged handoffs" derived from a
+  // truncated log is a confident wrong answer. Refuse instead, before deciding anything.
+  if (session) ledger.readEvents(session.sessionId, { expectSeq: session.eventSeq });
+  const targetCommit = target ? tryGit(['rev-parse', '--verify', `${target}^{commit}`], repo.root) : null;
+  const base = task?.frozen.baseRevision ?? null;
+  const baseIsAncestor = base && targetCommit
+    ? gitSucceeds(['merge-base', '--is-ancestor', base.replace(/^git:/, ''), targetCommit], repo.root)
+    : null;
+  const git = gitFreshness({ baseRevision: base, target, targetCommit, baseIsAncestor });
+
+  let observed = null;
+  if (typeof args['canonical-inputs'] === 'string' && args['canonical-inputs'] !== '') {
+    observed = readJson(path.resolve(args['canonical-inputs']));
+    if (!Array.isArray(observed)) {
+      die('--canonical-inputs must hold a JSON array of { id, revision } as the canonical authority currently reports them');
+    }
+  }
+  const inputs = inputsFreshness({ inputs: task?.frozen.inputs ?? null, observed });
+
+  // With a task, mail about a *different* task is not this answer's business: reconcile
+  // answers about one task, and a handoff about another would push aside the finding the
+  // caller asked for. With no task there is nothing to be beside, and the mail is the whole
+  // answer — filtering it out there is what left `ack-handoff` unreachable for a reviewer.
+  const handoffs = task
+    ? waiting.filter((row) => row.sessionId === session.sessionId && row.taskId === task.frozen.taskId)
+    : waiting.filter((row) => row.sessionId === session?.sessionId);
+  const candidate = typeof args.candidate === 'string' && args.candidate !== ''
+    ? args.candidate
+    : tryGit(['rev-parse', 'HEAD'], repo.root);
+  const candidateRevision = candidate ? `git:${candidate.replace(/^git:/, '')}` : null;
+  const review = task ? ledger.reviewStateFor(session.sessionId, task.frozen.taskId, { candidateRevision }) : null;
+  const asked = task ? gates(task) : [];
+  const validations = task
+    ? asked.map((gate) => ledger.validationStateFor(session.sessionId, task.frozen.taskId, { gate, candidateRevision }))
+    : [];
+
+  return {
+    session, task, target, base, targetCommit, baseIsAncestor,
+    git, inputs, handoffs, unreadable, candidateRevision, review, validations,
+  };
+}
+
+/**
  * `teamctl reconcile` — one command, one next action, after a context compaction (plan §12).
  *
  * Exits 0 whatever it finds, including `blocked`. A recovering Agent needs the answer, and a
@@ -991,79 +1084,19 @@ function currentTask(ledger, subject, args) {
  * what the current revision of `contract:checkout` is. Rather than infer freshness from
  * having nothing to compare against, `--canonical-inputs` accepts the observation from
  * whoever can make it and the report reads `unknown` when nobody did.
+ *
+ * What it does not answer is whether merging is safe. `integrate` here means the semantic half
+ * is satisfied — finished, reviewed, tested against this commit — and spec-suite's structural
+ * gate has not been consulted at all. `validate-candidate` is the command that composes both.
  */
 function reconcileCommand(args) {
   const { repo, ledger } = ledgerFor(args, { actorRequired: false });
   const binding = bindingFor(repo);
-  const subject = binding ? `agent:${binding.agentId}` : null;
 
   runLedger(() => {
-    const found = binding ? currentTask(ledger, subject, args) : null;
-    // Mail is read before the session is settled, because for a reviewer it is the only thing
-    // that names one: handoffs are addressed to a role, and a reviewer never holds a task of its
-    // own. `ledger.inbox` scans every session and tolerates one it cannot read, which is what
-    // makes it usable this early — and its unreadable rows are dropped here rather than used to
-    // resolve a session, because reading one would throw and turn a single corrupt session
-    // anywhere in the home into a refusal for every agent, which is the tolerance it exists for.
-    const rows = binding ? ledger.inbox({ role: binding.role, subject }) : [];
-    const waiting = rows.filter((row) => !row.unreadable);
-    const unreadable = rows.filter((row) => row.unreadable);
-    // A session named on the command line is read even when it holds no task for this agent, so
-    // the answer can be `await-task`. Without the flag a session is reachable three ways, in
-    // descending order of how much it says about what to do now: a task addressed to this agent,
-    // mail addressed to it, and — last — a session it has acted in before. Answering
-    // `open-session` to an Agent whose session already exists sends it into a collision it
-    // cannot act on from there, so the last fallback matters even though it names no work:
-    // `await-task` in the session you were in is the honest answer, and `participation` is what
-    // makes it reachable for a reviewer that has already acknowledged its mail.
-    const named = typeof args.session === 'string' && args.session !== '' ? args.session : null;
-    const revisited = binding && !found && !named && !waiting.length
-      ? ledger.participation({ subject })[0]?.sessionId ?? null
-      : null;
-    const session = found?.session
-      ?? (named && ledger.listSessions().includes(named) ? ledger.readSession(named) : null)
-      ?? (waiting.length ? ledger.readSession(waiting[0].sessionId) : null)
-      ?? (revisited ? ledger.readSession(revisited) : null);
-    const task = found?.task ?? null;
-
-    const target = session?.integrationTarget ?? null;
-    // The inbox tolerates a session whose event log cannot be read, because one corrupt session
-    // must not hide every other session's mail. Reconcile cannot afford the same tolerance: this
-    // is the only session it is answering about, and "no unacknowledged handoffs" derived from a
-    // truncated log is a confident wrong answer. Refuse instead, before deciding anything.
-    if (session) ledger.readEvents(session.sessionId, { expectSeq: session.eventSeq });
-    const targetCommit = target ? tryGit(['rev-parse', '--verify', `${target}^{commit}`], repo.root) : null;
-    const base = task?.frozen.baseRevision ?? null;
-    const baseIsAncestor = base && targetCommit
-      ? gitSucceeds(['merge-base', '--is-ancestor', base.replace(/^git:/, ''), targetCommit], repo.root)
-      : null;
-    const git = gitFreshness({ baseRevision: base, target, targetCommit, baseIsAncestor });
-
-    let observed = null;
-    if (typeof args['canonical-inputs'] === 'string' && args['canonical-inputs'] !== '') {
-      observed = readJson(path.resolve(args['canonical-inputs']));
-      if (!Array.isArray(observed)) {
-        die('--canonical-inputs must hold a JSON array of { id, revision } as the canonical authority currently reports them');
-      }
-    }
-    const inputs = inputsFreshness({ inputs: task?.frozen.inputs ?? null, observed });
-
-    // With a task, mail about a *different* task is not this answer's business: reconcile
-    // answers about one task, and a handoff about another would push aside the finding the
-    // caller asked for. With no task there is nothing to be beside, and the mail is the whole
-    // answer — filtering it out there is what left `ack-handoff` unreachable for a reviewer.
-    const handoffs = task
-      ? waiting.filter((row) => row.sessionId === session.sessionId && row.taskId === task.frozen.taskId)
-      : waiting.filter((row) => row.sessionId === session?.sessionId);
-    const gate = task ? gateFor(task, args) : null;
-    const candidate = typeof args.candidate === 'string' && args.candidate !== ''
-      ? args.candidate
-      : tryGit(['rev-parse', 'HEAD'], repo.root);
-    const candidateRevision = candidate ? `git:${candidate.replace(/^git:/, '')}` : null;
-    const review = task ? ledger.reviewStateFor(session.sessionId, task.frozen.taskId, { candidateRevision }) : null;
-    const validation = task
-      ? ledger.validationStateFor(session.sessionId, task.frozen.taskId, { gate, candidateRevision })
-      : null;
+    const o = observe({ repo, ledger, binding, args, gates: (task) => [gateFor(task, args)] });
+    const { session, task, git, inputs, handoffs, unreadable, candidateRevision, review } = o;
+    const validation = o.validations[0] ?? null;
 
     const decision = decide({ binding, session, task, freshness: { git, inputs }, handoffs, review, validation });
     emit({
@@ -1087,7 +1120,7 @@ function reconcileCommand(args) {
         // against and they move independently. Reporting only the snapshot would leave an
         // Agent staring at a stale artifact whose snapshot matches perfectly.
         taskFrozenDigest: task?.frozenDigest ?? null,
-        git: { ...git, target, targetCommit, baseRevision: base, baseIsAncestor },
+        git: { ...git, target: o.target, targetCommit: o.targetCommit, baseRevision: o.base, baseIsAncestor: o.baseIsAncestor },
         inputs,
         candidateRevision,
         unackedHandoffs: handoffs.map((row) => ({ handoffId: row.handoffId, from: row.from, nextAction: row.nextAction, stale: row.stale })),
@@ -1103,6 +1136,89 @@ function reconcileCommand(args) {
     });
   });
 }
+
+/**
+ * `teamctl validate-candidate` — the semantic half of the merge decision, for spec-suite to call.
+ *
+ * This is the external validation hook from the far side's point of view: spec-suite runs its own
+ * structural gate, calls this for the question it cannot answer, and merges only if both say yes.
+ * The top-level `status` is therefore the *semantic* verdict alone — that is the field spec-suite
+ * reads, and composing the two halves is spec-suite's business at that point, not this layer's.
+ *
+ * `integrationReady` is the composed answer, for the caller that is holding both reports. It is
+ * false unless `--structural` supplied spec-suite's own merge-gate result *and* that result is
+ * about the same commit this layer validated. Withholding it when nobody consulted the structural
+ * gate is the whole point: an approval and a green suite are not permission to merge, and this
+ * layer is in no position to know whether the write set was respected.
+ *
+ * Exits 0 whether or not the candidate passes, for the same reason `validate state` does: a
+ * non-zero exit for "the review has not happened yet" is indistinguishable from the validator
+ * having failed to run, and a caller that cannot tell those apart fails open on the wrong one.
+ */
+function validateCandidateCommand(args) {
+  const phase = requireFlag(args, 'phase');
+  if (!INTEGRATION_PHASES.includes(phase)) {
+    die(`--phase must be one of ${INTEGRATION_PHASES.join(', ')}`);
+  }
+  // A replayed candidate is a commit spec-suite created; it is not this worktree's HEAD and this
+  // layer has no way to find it. Falling back to HEAD would answer confidently about the tree the
+  // replay superseded, which is precisely the reuse this phase exists to prevent.
+  if (phase === 'post-replay' && !(typeof args.candidate === 'string' && args.candidate !== '')) {
+    die('--candidate is required for --phase post-replay: the replayed commit is spec-suite\'s, '
+      + 'and answering about this worktree\'s HEAD instead would validate the tree the replay replaced');
+  }
+  const { repo, ledger } = ledgerFor(args, { actorRequired: false });
+  const binding = bindingFor(repo);
+
+  runLedger(() => {
+    const o = observe({ repo, ledger, binding, args, gates: () => PHASE_GATES[phase] });
+    const { session, task, git, inputs, handoffs, candidateRevision, review, validations } = o;
+    // The same decision `reconcile` would give, on the gate that matters at this phase, so the
+    // verdict cannot contradict what the working Agent was told. `validations[0]` is the gate
+    // whose findings drive the next action; the rest are folded in by `semanticVerdict`.
+    const decision = decide({
+      binding, session, task, freshness: { git, inputs }, handoffs, review, validation: validations[0] ?? null,
+    });
+    const semantic = semanticVerdict({ phase, candidate: candidateRevision, decision, validations });
+
+    let raw = null;
+    if (typeof args.structural === 'string' && args.structural !== '') {
+      raw = readJson(path.resolve(args.structural));
+      if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+        die('--structural must hold spec-suite\'s merge-gate result object');
+      }
+    }
+    const structural = structuralVerdict(raw);
+    const composed = composeIntegration({ semantic, structural });
+
+    emit({
+      schemaVersion: 1,
+      // First, and named as the hook's contract names them: a caller may read `status` and
+      // nothing else, and anything other than `passed` is a refusal.
+      status: semantic.status,
+      phase,
+      candidate: candidateRevision,
+      agent: binding ? binding.agentId : null,
+      session: session?.sessionId ?? null,
+      task: task?.frozen.taskId ?? null,
+      integrationReady: composed.integrationReady,
+      reasons: composed.reasons,
+      semantic: {
+        status: semantic.status,
+        nextAction: semantic.nextAction,
+        reasons: semantic.reasons,
+        gates: semantic.gates,
+        freshness: { git: git.state, inputs: inputs.state },
+        review: review === null ? null : { status: review.status, applies: review.applies, reasons: review.reasons },
+        taskFrozenDigest: task?.frozenDigest ?? null,
+        inputSnapshotDigest: task?.inputSnapshotDigest ?? null,
+      },
+      structural,
+      sameCandidate: composed.sameCandidate,
+    });
+  });
+}
+
 
 /**
  * `teamctl metrics` — §14's counters, and the ones nothing records named rather than zeroed.
@@ -1163,6 +1279,14 @@ function usage() {
     `  valued; --canonical-inputs takes [{ id, revision }] from whoever can ask the canonical\n` +
     `  authority, because this layer holds input ids and not the locations they live at, and an\n` +
     `  input nobody asked about reads unknown instead of fresh.\n` +
+    `  validate-candidate --phase <${INTEGRATION_PHASES.join('|')}> [--session <id>] [--task <id>]\n` +
+    `                     [--candidate <revision>] [--canonical-inputs <file>] [--structural <file>]\n` +
+    `  The semantic half of the merge decision, for spec-suite's external validation hook to call.\n` +
+    `  status is this layer's verdict alone and is the field the hook reads; integrationReady is the\n` +
+    `  composed answer and stays false until --structural supplies spec-suite's own merge-gate\n` +
+    `  result about the same commit. post-replay requires --candidate: the replayed commit is not\n` +
+    `  this worktree's HEAD, and it asks ${PHASE_GATES['post-replay'].join(' + ')} because a review of the tree a replay\n` +
+    `  replaced is not a review of the tree it produced.\n` +
     `  metrics            [--session <id>]\n` +
     `  Counted from the sealed event log, never from directory scans, so a truncated log refuses\n` +
     `  rather than reporting a smaller number. What nothing records is listed in unavailable with\n` +
@@ -1171,6 +1295,7 @@ function usage() {
     `  next action:      ${HANDOFF_ACTIONS.join(', ')}\n` +
     `  reconcile status: ${RECONCILE_STATUSES.join(', ')}\n` +
     `  reconcile action: ${NEXT_ACTIONS.join(', ')}   (in precedence order)\n` +
+    `  integration:      ${INTEGRATION_STATUSES.join(', ')}   (unknown never widens into a pass)\n` +
     `  session status:   ${SESSION_STATUSES.join(', ')}\n` +
     `  task status:      ${TASK_STATUSES.join(', ')}\n` +
     `  review status:    ${REVIEW_STATUSES.join(', ')}\n` +
@@ -1201,5 +1326,6 @@ else if (command === 'review') reviewCommand(args);
 else if (command === 'validate') validateCommand(args);
 else if (command === 'project-spec-task') projectSpecTaskCommand(args);
 else if (command === 'reconcile') reconcileCommand(args);
+else if (command === 'validate-candidate') validateCandidateCommand(args);
 else if (command === 'metrics') metricsCommand(args);
 else die(`unknown command ${command}`);
