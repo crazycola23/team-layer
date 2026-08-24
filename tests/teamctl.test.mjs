@@ -927,7 +927,8 @@ test('project-spec-task projects the frozen packet and reports what stayed behin
   const out = JSON.parse(run(['project-spec-task', '--session', 'feature:coupon',
     '--task', 'task:coupon-api'], { ...f, env }).stdout);
   assert.deepEqual(out.projection.writeSet, ['src/coupon/**'], 'the edited file must not be the source');
-  assert.deepEqual(out.projected, ['baseRevision', 'readSet', 'role', 'subject', 'writeSet']);
+  assert.deepEqual(out.projected,
+    ['baseRevision', 'readSet', 'role', 'subject', 'taskId', 'writeSet']);
   assert.equal(out.generation, 1);
   assert.match(out.frozenDigest, /^sha256:[0-9a-f]{64}$/);
   assert.equal(out.capabilitySource, 'probed');
@@ -957,10 +958,29 @@ test('project-spec-task --output writes the projection alone', () => {
     '--task', 'task:coupon-api', '--output', 'spec-task.json'], { ...f, env }).stdout);
   const written = JSON.parse(fs.readFileSync(path.join(f.repo, 'spec-task.json'), 'utf8'));
   assert.deepEqual(written, out.projection);
-  assert.deepEqual(Object.keys(written).sort(), out.projected);
-  for (const teamOnly of ['taskId', 'sessionId', 'compatibility', 'withheld', 'inputs', 'validationPlan', 'frozenDigest']) {
+  /**
+   * Spelled out as a literal, not as `out.projected`.
+   *
+   * The report and the file are written by the same code, so comparing them proves only that it
+   * is self-consistent — a projection that dropped a field would drop it from both and the
+   * assertion would follow it down. This list is what spec-suite's task contract actually reads,
+   * and `schemaVersion` is on it because `project-context.mjs` demands it while the merge gate
+   * never looks; the file has to satisfy both.
+   */
+  assert.deepEqual(Object.keys(written).sort(),
+    ['baseRevision', 'readSet', 'role', 'schemaVersion', 'subject', 'taskId', 'writeSet']);
+  assert.deepEqual(Object.keys(written).sort(), [...out.projected, 'schemaVersion'].sort());
+  for (const teamOnly of ['sessionId', 'compatibility', 'withheld', 'inputs', 'validationPlan', 'frozenDigest']) {
     assert.equal(teamOnly in written, false, `${teamOnly} must not reach spec-suite`);
   }
+  /**
+   * `taskId` is the counter-example, so it is asserted rather than merely absent from the list above.
+   *
+   * It used to be on it. The merge gate refuses a task whose `taskId` is not a non-empty string, so
+   * withholding it produced a file the real gate could not read at all — the hazard this test names
+   * runs both ways, and a field spec-suite requires is not a leak.
+   */
+  assert.equal(written.taskId, 'task:coupon-api');
   assert.equal(out.output, path.join(f.repo, 'spec-task.json'));
 });
 

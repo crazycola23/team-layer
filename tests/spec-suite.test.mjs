@@ -8,6 +8,7 @@ import {
   SPEC_SUITE_CAPABILITIES, ASSUMED_PROJECTABLE_FIELDS, TEAM_LAYER_ONLY_FIELDS,
   detectCapabilities, probeCapabilities, projectSpecTask,
 } from '../src/spec-suite.mjs';
+import { requireSpecSuite } from './helpers/cross-repo.mjs';
 
 /**
  * A stand-in spec-suite, because the interesting cases are ones no real install is in.
@@ -226,14 +227,63 @@ test('a handshake that is present and broken falls back to probing, loudly', () 
 test('only whitelisted fields travel, and everything else is accounted for', () => {
   const detection = probeCapabilities(install());
   const result = projectSpecTask(packet(), detection);
-  assert.deepEqual(result.projected, ['baseRevision', 'readSet', 'role', 'subject', 'writeSet']);
-  assert.deepEqual(Object.keys(result.projection).sort(), result.projected);
+  assert.deepEqual(result.projected,
+    ['baseRevision', 'readSet', 'role', 'subject', 'taskId', 'writeSet']);
+  // The artifact is the projected fields plus what it declares on spec-suite's authority.
+  assert.deepEqual(Object.keys(result.projection).sort(),
+    [...result.projected, 'schemaVersion'].sort());
+  assert.equal(result.projection.schemaVersion, 1);
   // Every packet field is either projected or explained. Nothing may simply vanish.
   const accounted = new Set([...result.projected, ...result.withheld.map((w) => w.field)]);
   assert.deepEqual([...accounted].sort(), Object.keys(packet()).sort());
   for (const field of TEAM_LAYER_ONLY_FIELDS) {
     assert.equal(withheldFor(result, field).reason, 'team-layer-owned', field);
   }
+});
+
+/**
+ * The two `schemaVersion` fields are not the same field.
+ *
+ * They are the `stale-base` problem in miniature: one name, two meanings, on opposite sides of a
+ * boundary. Projecting the packet's number verbatim would hand spec-suite a version of a schema
+ * it has never seen and its document policy would reject anything but `1`; withholding it without
+ * substituting would produce an artifact its projection path rejects for a missing field. So the
+ * artifact declares spec-suite's constant and the report says the packet's stayed home — which
+ * has to remain true when this layer's own packet version moves.
+ */
+test('the artifact declares spec-suite\'s schemaVersion, not this layer\'s', () => {
+  const detection = probeCapabilities(install());
+  const result = projectSpecTask(packet({ schemaVersion: 7 }), detection);
+  assert.equal(result.projection.schemaVersion, 1);
+  assert.equal(result.projected.includes('schemaVersion'), false);
+  assert.match(withheldFor(result, 'schemaVersion').detail, /count different schemas/);
+});
+
+/**
+ * The field spec-suite requires travels even when the discovery experiment never mentions it.
+ *
+ * This is the bug the list exists for. `projectionConcurrencyFields` answers a question about
+ * scheduling keys, so it is silent about `taskId` — and reading that silence as a refusal
+ * produced a task artifact `evaluateMergeGate` rejected before resolving a single commit, with a
+ * message about a missing field rather than anything to do with the candidate. A capability the
+ * far side does not have is a negotiation; a field it requires is not.
+ */
+test('a required field travels regardless of what the whitelist discovered', () => {
+  const detection = probeCapabilities(install());
+  // The narrowest whitelist there is: the far side kept nothing at all.
+  detection.projectableFields = { fields: [], discovered: true };
+  const result = projectSpecTask(packet(), detection);
+  assert.equal(result.projection.taskId, packet().taskId);
+  assert.deepEqual(result.projected, ['taskId']);
+  assert.equal(withheldFor(result, 'baseRevision').reason, 'not-projectable');
+});
+
+test('a packet with no taskId cannot be projected at all', () => {
+  const detection = probeCapabilities(install());
+  const incomplete = packet();
+  delete incomplete.taskId;
+  assert.throws(() => projectSpecTask(incomplete, detection),
+    { name: 'TypeError', message: /must carry taskId/ });
 });
 
 /**
@@ -367,13 +417,14 @@ test('a packet that is not an object is a programming error, not a projection', 
  * The synthetic installs above encode what this skill believes about spec-suite. Pointed at
  * a real checkout, this asserts the belief is still true — the probe reaching the wrong
  * conclusion about a real install is the only failure that matters, and no fake can catch it.
+ *
+ * The gate is `requireSpecSuite` rather than a bare `return`, which is what this test used to do:
+ * node's runner counts a returning test as a pass, so on every machine without a checkout — which
+ * is most of them — this reported the belief as verified without having looked.
  */
 test('spec-suite-real: a real checkout answers the probe coherently', (t) => {
-  const root = process.env.TEAM_LAYER_SPEC_SUITE_ROOT;
-  if (!root) {
-    t.diagnostic('set TEAM_LAYER_SPEC_SUITE_ROOT to a spec-suite checkout to run this against reality');
-    return;
-  }
+  const root = requireSpecSuite(t);
+  if (!root) return;
   const detection = detectCapabilities({ root });
   assert.notEqual(detection.source, 'unavailable', `${root} does not look like a spec-suite checkout`);
   assert.equal(detection.projectableFields.discovered, true,
@@ -385,4 +436,12 @@ test('spec-suite-real: a real checkout answers the probe coherently', (t) => {
   const result = projectSpecTask(packet(), detection);
   assert.equal(result.projection.writeSet.length, 1);
   assert.equal('validationPlan' in result.projection, false, 'the team layer must not leak into spec-suite');
+  /**
+   * And the field a real gate requires is really in there.
+   *
+   * The probe cannot discover this one — it asks about scheduling — so against a real install this
+   * is the assertion that the unconditional class is doing its job.
+   */
+  assert.equal(result.projection.taskId, packet().taskId);
+  assert.equal(result.projection.schemaVersion, 1);
 });

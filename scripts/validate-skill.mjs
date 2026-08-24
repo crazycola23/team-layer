@@ -6,6 +6,7 @@ import os from 'node:os';
 
 import {
   SPEC_SUITE_CAPABILITIES, CAPABILITY_SUPPORT, ASSUMED_PROJECTABLE_FIELDS, TEAM_LAYER_ONLY_FIELDS,
+  CONTRACT_REQUIRED_FIELDS,
   FIELD_CAPABILITY, detectCapabilities, probeCapabilities,
 } from '../src/spec-suite.mjs';
 import { NEXT_ACTIONS, RECONCILE_STATUSES } from '../src/reconcile.mjs';
@@ -504,6 +505,7 @@ try {
 const packetFields = Object.keys(JSON.parse(text('schemas/task-packet.schema.json')).properties);
 const classified = new Map();
 for (const [list, fields] of [
+  ['CONTRACT_REQUIRED_FIELDS', CONTRACT_REQUIRED_FIELDS],
   ['ASSUMED_PROJECTABLE_FIELDS', ASSUMED_PROJECTABLE_FIELDS],
   ['TEAM_LAYER_ONLY_FIELDS', TEAM_LAYER_ONLY_FIELDS],
   ['FIELD_CAPABILITY', Object.keys(FIELD_CAPABILITY)],
@@ -515,8 +517,26 @@ for (const [list, fields] of [
   }
 }
 for (const field of packetFields) {
-  ok(classified.has(field), `task packet field ${field} is in none of ASSUMED_PROJECTABLE_FIELDS, `
-    + 'TEAM_LAYER_ONLY_FIELDS or FIELD_CAPABILITY: decide whether it crosses to spec-suite');
+  ok(classified.has(field), `task packet field ${field} is in none of CONTRACT_REQUIRED_FIELDS, `
+    + 'ASSUMED_PROJECTABLE_FIELDS, TEAM_LAYER_ONLY_FIELDS or FIELD_CAPABILITY: decide whether it '
+    + 'crosses to spec-suite');
+}
+/**
+ * A required field may not also be capability-governed, and must be in the packet's own required list.
+ *
+ * Both halves close the same hole from opposite sides. A field spec-suite *requires* cannot be
+ * something this layer negotiates — the projection deliberately does not run those through the
+ * discovered whitelist, so listing one under `FIELD_CAPABILITY` would write a capability check
+ * that no code path consults. And if the packet schema lets the field be absent, then a valid
+ * packet can reach a projection that throws, which turns a schema decision into a runtime crash.
+ */
+const packetRequired = JSON.parse(text('schemas/task-packet.schema.json')).required ?? [];
+for (const field of CONTRACT_REQUIRED_FIELDS) {
+  ok(!Object.prototype.hasOwnProperty.call(FIELD_CAPABILITY, field),
+    `${field} is required by spec-suite's task contract and cannot also be capability-governed`);
+  ok(packetRequired.includes(field), `spec-suite requires ${field} of every task, so the task packet `
+    + 'schema must require it too: an optional packet field that the projection insists on is a crash '
+    + 'waiting for the first packet that omits it');
 }
 for (const capability of Object.values(FIELD_CAPABILITY)) {
   ok(SPEC_SUITE_CAPABILITIES.includes(capability),
@@ -738,6 +758,46 @@ if (fs.existsSync(path.join(ROOT, CI_WORKFLOW))) {
   ok(claimed >= 100,
     `${CI_WORKFLOW} must refuse a suite smaller than a substantial floor, found ${claimed}: `
     + 'a floor low enough for a broken run to clear is the same as no floor');
+}
+
+/**
+ * The tests that run the real far side must keep existing, and must keep being conditional loudly.
+ *
+ * Every other test in the suite fakes spec-suite, and a fake built from the same belief as the code
+ * agrees with it when the belief is wrong — that is how `taskId` was withheld from an artifact the
+ * real merge gate refuses, with a green suite. `tests/cross-repo.test.mjs` is the only file that
+ * runs spec-suite's own binaries, so it has two ways to stop protecting anything without turning a
+ * line red: someone deletes a test from it, or someone converts the missing-checkout branch into an
+ * early `return`, which node's runner counts as a pass.
+ *
+ * So: the named tests must be present, and the file must reach for `requireSpecSuite` — the helper
+ * whose only job is to record a `skip` with the variable to set — rather than deciding for itself
+ * what to do when there is no checkout.
+ */
+const CROSS_REPO = 'tests/cross-repo.test.mjs';
+ok(fs.existsSync(path.join(ROOT, CROSS_REPO)),
+  `missing ${CROSS_REPO}: the only tests that run spec-suite's own code`);
+if (fs.existsSync(path.join(ROOT, CROSS_REPO))) {
+  const crossRepo = text(CROSS_REPO);
+  const names = [...crossRepo.matchAll(/^test\('(cross-repo: [^']*)'/gm)].map((m) => m[1]);
+  ok(names.length >= 5,
+    `${CROSS_REPO} must keep at least five cross-repo tests, found ${names.length}: `
+    + `[${names.join('; ')}]`);
+  for (const [claim, pattern] of [
+    ['a projected task is read by the real merge gate', /real merge gate reads a projected task/],
+    ['spec-suite, not this layer, is what requires taskId', /makes taskId non-negotiable/],
+    ["a real verdict is legible to this layer's composer", /legible to structuralVerdict/],
+  ]) {
+    ok(names.some((name) => pattern.test(name)),
+      `${CROSS_REPO} must still prove that ${claim}; its tests are [${names.join('; ')}]`);
+  }
+  ok(crossRepo.includes('requireSpecSuite'),
+    `${CROSS_REPO} must gate on requireSpecSuite, which records a skip and names `
+    + 'TEAM_LAYER_SPEC_SUITE_ROOT: a bare early return is counted as a pass, so a machine with no '
+    + 'checkout would report the far side as verified');
+  ok(text('tests/helpers/cross-repo.mjs').includes('t.skip('),
+    'requireSpecSuite must call t.skip: it exists so a missing checkout is reported as skipped '
+    + 'rather than passed, and that is the one line that makes the whole file honest');
 }
 
 if (failures.length) {

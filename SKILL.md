@@ -241,6 +241,7 @@ existing spec-suite boundary:
 ```text
 Team layer                       spec-suite layer
 -----------                      ----------------
+taskId                           taskId (the merge gate requires it)
 agentId                          subject
 role                             role (descriptive metadata)
 work start observation           baseRevision

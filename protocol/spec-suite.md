@@ -104,6 +104,7 @@ Example:
 ```text
 Team packet                       spec-suite
 -----------                       ----------
+taskId: task:coupon-api        →  taskId: task:coupon-api
 agentId: fullstack-01          →  subject: agent:fullstack-01
 role: fullstack                →  role: fullstack
 baseRevision                   →  baseRevision
@@ -111,9 +112,36 @@ readSet                        →  readSet
 writeSet                       →  writeSet
 inputs                         →  team layer only (until supported natively)
 acceptance                     →  product/review layer
+schemaVersion                  →  spec-suite's own, declared not projected
 ```
 
 Do not assume spec-suite accepts unknown fields.
+
+### What the far side requires is not negotiable
+
+The whitelist below is *discovered*, by asking spec-suite's own
+`projectionConcurrencyFields` which keys it keeps. That answer is about scheduling, so it names the
+five concurrency fields and nothing else — and for a while this layer read its silence about
+`taskId` as "spec-suite does not want it" and filed the field as team-layer-owned.
+
+The opposite was true. `evaluateMergeGate` refuses a task whose `taskId` is not a non-empty string
+before it resolves a single commit, so the projection was producing an artifact the real gate could
+not read, and no amount of probing would ever have found it. `CONTRACT_REQUIRED_FIELDS` therefore
+travels unconditionally, outside the discovered whitelist, and no capability may gate it: a field
+the far side *requires* is not a feature to negotiate — if it did not travel there would be nothing
+to negotiate about, only a gate failing closed for the wrong reason.
+
+`scripts/validate-skill.mjs` holds the corollary: a required field may not also appear in
+`FIELD_CAPABILITY`, and must be required by the task packet schema itself, so the projection's
+refusal to build an unreadable artifact can never be reached by a schema-valid packet.
+
+**`schemaVersion` is the mirror image.** Both layers number their schemas and the numbers count
+different things, so the packet's version must not cross — but an artifact without one is rejected
+by `project-context.mjs`. So the artifact *declares* spec-suite's constant on spec-suite's
+authority. The report keeps `projected` and `withheld` a partition of the *packet* and names the
+declared key separately in `declared`, because a field cannot honestly be reported as both carried
+and withheld, and today the two numbers are both `1` — so comparing values would agree while the
+one fact worth stating is that they are not the same fact.
 
 ### Project by whitelist, because the far side does not complain
 
@@ -161,6 +189,35 @@ that a same-named field means the same thing.
 **No handshake exists to settle either.** When `capabilitySource` is `probed` or `unavailable`,
 no capability versions are known and both layers' vocabularies are being matched up by this
 skill's reading of them. Prefer the explicit boundary over the convenient inference.
+
+## Testing across the boundary
+
+Everything above is this skill's reading of spec-suite, and a reading can be wrong in a way no test
+in this repository will notice: the fakes were built from the same reading as the code, so when the
+belief is wrong the fake is wrong in the same direction and the suite stays green. `taskId` was
+exactly that — withheld as team-layer-owned, with passing projection tests, and unreadable by the
+real merge gate.
+
+`tests/cross-repo.test.mjs` is the answer, and the rule for it is: at least one test in every
+direction must run the other side's actual code. Projected task into spec-suite's real gate;
+spec-suite's real verdict back into `structuralVerdict` and `validate-candidate`. A test that
+writes a JSON shape by hand and proves this layer can read it proves nothing about the far side.
+
+It needs a checkout, found in this order:
+
+```bash
+TEAM_LAYER_SPEC_SUITE_ROOT=/path/to/spec-suite npm test   # explicit wins, even if unusable
+npm test                                                  # else ../spec-suite, ../spec-suite-work
+```
+
+Without one, those tests report `skipped` with the variable named — not a pass. The distinction is
+the whole value of the file: node's runner counts a test that returns early as passing, so a
+conditional test written the obvious way reports an unverified belief as verified on every machine
+that lacks the far side, which is most of them.
+
+**CI does not run them.** The workflow checks out this repository only, so a green tick means the
+semantic half is sound, not that the composition is. Confirming the boundary is a local step, or a
+step for whoever adds a second checkout to CI.
 
 ## Merge/revalidation expectations
 

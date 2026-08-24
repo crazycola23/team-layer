@@ -56,6 +56,23 @@ export const CAPABILITY_SOURCES = ['declared', 'probed', 'unavailable'];
 export const ASSUMED_PROJECTABLE_FIELDS = ['baseRevision', 'readSet', 'writeSet', 'subject', 'role'];
 
 /**
+ * Fields spec-suite's task contract requires of every task, whatever the install can do.
+ *
+ * `taskId` is not a concurrency field, so the discovery experiment below — which asks
+ * spec-suite's own `projectionConcurrencyFields` which keys it keeps — will never name it, and
+ * this layer used to read that silence as "spec-suite does not want it" and file `taskId` as
+ * team-layer-owned. It is the opposite: `evaluateMergeGate` refuses a task whose `taskId` is not
+ * a non-empty string before it resolves a single commit. The projection was producing an
+ * artifact the real gate could not read, and no amount of probing would have found it, because
+ * the probe only ever asked which *scheduling* fields survive.
+ *
+ * So these travel unconditionally, outside the discovered whitelist, and no capability may gate
+ * them. A field the far side *requires* is not a feature to negotiate — if it did not travel
+ * there would be nothing to negotiate about, only a gate that fails closed for the wrong reason.
+ */
+export const CONTRACT_REQUIRED_FIELDS = ['taskId'];
+
+/**
  * Team packet fields that are the team layer's own and are never projected.
  *
  * Not "unsupported" — `acceptance` and `validationPlan` are not things spec-suite is
@@ -63,16 +80,31 @@ export const ASSUMED_PROJECTABLE_FIELDS = ['baseRevision', 'readSet', 'writeSet'
  * layer). Listing them explicitly is what makes `withheld` readable: an Agent seeing
  * `inputs` withheld for a capability reason and `acceptance` withheld for an ownership
  * reason should not have to work out which is which.
+ *
+ * `schemaVersion` is here for a subtler reason than ownership: both sides have a field of that
+ * name and they count different things. Projecting this layer's packet version verbatim would
+ * hand spec-suite a number about a schema it has never seen, and its own document policy
+ * requires exactly `1`. So the packet's version stays behind and the artifact declares
+ * spec-suite's, which is a translation rather than a projection — see `SPEC_TASK_SCHEMA_VERSION`.
  */
-export const TEAM_LAYER_ONLY_FIELDS = ['schemaVersion', 'taskId', 'sessionId', 'acceptance', 'validationPlan'];
+export const TEAM_LAYER_ONLY_FIELDS = ['schemaVersion', 'sessionId', 'acceptance', 'validationPlan'];
+
+/**
+ * The `schemaVersion` spec-suite's document policy requires of a task artifact.
+ *
+ * A constant of the far side's contract, not a mirror of ours. `assertSchemaVersion` demands
+ * exactly `1` and `evaluateMergeGate` never looks — so emitting it costs nothing at the gate and
+ * is what makes the same artifact readable by the projection and lease paths that do look.
+ */
+export const SPEC_TASK_SCHEMA_VERSION = 1;
 
 /**
  * Which capability a projectable field depends on. Fields absent from this map need none.
  *
- * Exported so `scripts/validate-skill.mjs` can prove that this map, `ASSUMED_PROJECTABLE_FIELDS`
- * and `TEAM_LAYER_ONLY_FIELDS` between them account for every field of a task packet. A field
- * added to the packet and to none of the three would quietly file as `not-projectable`, which
- * is a decision nobody made appearing as a decision somebody made.
+ * Exported so `scripts/validate-skill.mjs` can prove that this map, `CONTRACT_REQUIRED_FIELDS`,
+ * `ASSUMED_PROJECTABLE_FIELDS` and `TEAM_LAYER_ONLY_FIELDS` between them account for every field
+ * of a task packet. A field added to the packet and to none of the four would quietly file as
+ * `not-projectable`, which is a decision nobody made appearing as a decision somebody made.
  */
 export const FIELD_CAPABILITY = { inputs: 'semanticInputs' };
 
@@ -296,6 +328,27 @@ export function projectSpecTask(packet, detection) {
   const withheld = [];
 
   /**
+   * What the far side requires travels first, and is not filtered through the whitelist.
+   *
+   * The whitelist answers "which optional fields does this install carry"; a required field is
+   * not in that conversation. Running the required fields through `allowed` is precisely the bug
+   * this list exists to fix — the discovery experiment asks about concurrency keys, so it is
+   * silent about `taskId`, and treating that silence as a refusal produced a task artifact the
+   * merge gate rejected before it read anything else.
+   *
+   * A packet missing one of them cannot be projected into anything usable, so this throws rather
+   * than emitting an artifact whose first symptom is a gate failing for a reason that has nothing
+   * to do with the candidate.
+   */
+  for (const field of CONTRACT_REQUIRED_FIELDS) {
+    if (!Object.prototype.hasOwnProperty.call(packet, field)) {
+      throw new TypeError(`a task packet must carry ${field}: spec-suite's task contract requires it`);
+    }
+    projection[field] = packet[field];
+  }
+  projection.schemaVersion = SPEC_TASK_SCHEMA_VERSION;
+
+  /**
    * A capability-governed field is attributed to its capability first, even when the
    * whitelist never mentioned it.
    *
@@ -327,12 +380,25 @@ export function projectSpecTask(packet, detection) {
     projection[field] = packet[field];
   }
 
+  /**
+   * Whether a packet field travelled is recorded as it travels, not inferred from the artifact.
+   *
+   * `schemaVersion` is why. The artifact has one and the packet's did not travel, so asking the
+   * artifact would report the field as carried — and today the two numbers are both `1`, so even
+   * comparing the values would agree. The one fact worth reporting is that they count different
+   * schemas, and only the code that did the copying knows which of them is in there.
+   */
+  const carried = new Set([...CONTRACT_REQUIRED_FIELDS,
+    ...allowed.filter((field) => Object.prototype.hasOwnProperty.call(projection, field))]);
+
   for (const field of Object.keys(packet)) {
-    if (Object.prototype.hasOwnProperty.call(projection, field)) continue;
+    if (carried.has(field)) continue;
     if (withheld.some((w) => w.field === field)) continue;
     withheld.push(TEAM_LAYER_ONLY_FIELDS.includes(field)
       ? { field, reason: 'team-layer-owned', capability: null,
-        detail: 'this layer owns the field; spec-suite is not missing it', authority: 'team-layer' }
+        detail: field === 'schemaVersion'
+          ? `both layers have a schemaVersion and they count different schemas; the artifact declares spec-suite's ${SPEC_TASK_SCHEMA_VERSION}`
+          : 'this layer owns the field; spec-suite is not missing it', authority: 'team-layer' }
       : { field, reason: 'not-projectable', capability: null,
         detail: `spec-suite's task contract does not carry ${field}`, authority: 'team-layer' });
   }
@@ -346,7 +412,17 @@ export function projectSpecTask(packet, detection) {
     // Deliberately not over the compatibility report: notes mention paths and versions,
     // and a digest that moved when the *reporting* changed would be no use for comparison.
     projectionDigest: jsonDigest(projection),
-    projected: Object.keys(projection).sort(),
+    /**
+     * The packet fields that travelled — not the artifact's keys.
+     *
+     * They differ by exactly one: the artifact declares spec-suite's `schemaVersion`, which is
+     * not a projection of anything. Reporting it here would claim the packet's version crossed
+     * over, and it is also in `withheld` saying it did not. One field cannot be both, so
+     * `projected` and `withheld` stay a partition of the *packet*, and `declared` says what the
+     * artifact adds on its own authority.
+     */
+    projected: [...carried].sort(),
+    declared: { schemaVersion: SPEC_TASK_SCHEMA_VERSION },
     withheld: withheld.sort((a, b) => a.field.localeCompare(b.field)),
     compatibility: {
       // `degraded` is a status, not a warning buried in prose: something the far side could
