@@ -100,7 +100,7 @@ which is what makes staleness detectable later:
   ],
   "acceptance": ["AC-1 valid coupon updates the server-authoritative total"],
   "validationPlan": [
-    { "checkId": "unit-tests", "kind": "command", "requiredAt": ["handoff", "merge"], "command": "npm test" },
+    { "checkId": "unit-tests", "kind": "command", "requiredAt": ["handoff", "merge"], "argv": ["node", "--test", "tests/"] },
     { "checkId": "peer-review", "kind": "review", "requiredAt": ["merge"], "role": "reviewer" }
   ]
 }

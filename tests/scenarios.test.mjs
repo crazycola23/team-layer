@@ -37,7 +37,7 @@ const A2 = `sha256:${'a2'.repeat(32)}`;
  * gate in this file read `unknown` for the wrong reason — the interesting `unknown`s below are
  * the ones staleness produces, and they have to be distinguishable from a broken runner.
  */
-const nodeCheck = (script) => `"${process.execPath}" -e "${script}"`;
+const nodeArgv = (script) => [process.execPath, '-e', script];
 
 /** The product architect, an implementer, and a reviewer, each in its own worktree. */
 function team() {
@@ -79,7 +79,7 @@ function couponPacket(t, overrides = {}) {
         checkId: 'unit-tests',
         kind: 'command',
         requiredAt: ['handoff', 'merge'],
-        command: nodeCheck("console.log('coupon: 12 passing')"),
+        argv: nodeArgv("console.log('coupon: 12 passing')"),
       },
       { checkId: 'peer-review', kind: 'review', requiredAt: ['merge'], role: 'reviewer' },
     ],

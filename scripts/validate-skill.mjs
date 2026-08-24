@@ -10,6 +10,7 @@ import {
 } from '../src/spec-suite.mjs';
 import { NEXT_ACTIONS, RECONCILE_STATUSES } from '../src/reconcile.mjs';
 import { METRIC_SOURCES, DERIVED_METRICS, UNAVAILABLE_METRICS } from '../src/metrics.mjs';
+import { VALIDATION_KINDS, RUNNABLE_KINDS } from '../src/validation.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const failures = [];
@@ -311,21 +312,41 @@ for (const derived of ['stale', 'applies', 'current', 'gate']) {
 }
 
 /**
- * Two closed branches, because src/schema.mjs has no `if/then` and no `not`.
+ * One closed branch per kind, because src/schema.mjs has no `if/then` and no `not`.
  *
  * "A command check may not name a reviewer" is expressed by there being no branch that
  * allows both — the closure is the enforcement. A single open object with every field
  * optional would validate a check the runner cannot run, inside a packet that is frozen
  * by the time anyone finds out.
+ *
+ * Counted against VALIDATION_KINDS rather than a literal, so adding a kind to the
+ * vocabulary and forgetting the schema branch fails here. Without that, the new kind
+ * would be rejected by every packet that used it, and the error would name the packet.
  */
 const checkSchema = JSON.parse(text('schemas/validation-check.schema.json'));
-ok(Array.isArray(checkSchema.oneOf) && checkSchema.oneOf.length === 2,
-  'a validation check must be a oneOf over its kinds, since the schema dialect has no if/then');
-for (const branch of ['commandCheck', 'reviewCheck']) {
+const kindBranches = new Map(VALIDATION_KINDS.map((kind) => [kind,
+  kind === 'command' ? 'commandCheck' : kind === 'shell-command' ? 'shellCommandCheck' : `${kind}Check`]));
+ok(Array.isArray(checkSchema.oneOf) && checkSchema.oneOf.length === kindBranches.size,
+  `a validation check must be a oneOf over its ${kindBranches.size} kinds, since the schema dialect has no if/then`);
+for (const [kind, branch] of kindBranches) {
   const def = checkSchema.$defs?.[branch];
   ok(def?.additionalProperties === false, `${branch} must be closed, or the kinds stop being distinguishable`);
-  ok(def?.properties?.kind?.const, `${branch} must pin its kind with const`);
+  ok(def?.properties?.kind?.const === kind, `${branch} must pin kind with const ${JSON.stringify(kind)}`);
+  ok(checkSchema.oneOf.some((entry) => entry.$ref === `#/$defs/${branch}`),
+    `the oneOf must include ${branch}, or a ${kind} check is valid vocabulary that no schema accepts`);
 }
+// The whole point of splitting the runnable kinds: `command` takes argv and must not
+// take a shell line, and the closed branches are what make that unforgeable. Asserted
+// here because a branch that accepted both would look identical from outside.
+ok(RUNNABLE_KINDS.includes('command') && RUNNABLE_KINDS.includes('shell-command'),
+  'both runnable kinds must be recorded as runnable, or recorded evidence for one of them is refused');
+ok(checkSchema.$defs?.commandCheck?.required?.includes('argv')
+  && checkSchema.$defs.commandCheck.properties?.command === undefined,
+  'a command check must require argv and have no command field: an argv check that accepts a shell line '
+    + 'is a shell check wearing the safer name');
+ok(checkSchema.$defs?.shellCommandCheck?.required?.includes('command')
+  && checkSchema.$defs.shellCommandCheck.properties?.argv === undefined,
+  'a shell-command check must require command and have no argv field');
 ok(checkSchema.$defs?.reviewCheck?.properties?.role?.$ref === 'role.schema.json',
   'a review check must $ref role.schema.json rather than inlining the role list');
 ok(checkSchema.$defs?.requiredAt?.items?.$ref === 'validation-gate.schema.json',

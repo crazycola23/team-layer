@@ -46,7 +46,7 @@ for (let n = 0; n < writers; n += 1) {
       inputs: [{ id: 'contract:coupon', revision: `sha256:${String(n).repeat(64).slice(0, 64)}`, authority: 'product-architect' }],
       acceptance: ['AC-1'],
       validationPlan: [
-        { checkId: 'unit-tests', kind: 'command', requiredAt: ['merge'], command: 'npm test' },
+        { checkId: 'unit-tests', kind: 'command', requiredAt: ['merge'], argv: ['node', '--test', 'tests/'] },
       ],
     },
   });

@@ -9,7 +9,9 @@ import { roleIds, isRole, roleFile, roleVersion } from '../src/roles.mjs';
 import { Ledger, LedgerError, SESSION_STATUSES, TASK_STATUSES, HANDOFF_ACTIONS, REVIEW_STATUSES } from '../src/ledger.mjs';
 import { SlugError } from '../src/slug.mjs';
 import { DigestError } from '../src/digest.mjs';
-import { runCommandCheck, checksRequiredAt, VALIDATION_GATES } from '../src/validation.mjs';
+import {
+  runCommandCheck, checksRequiredAt, VALIDATION_GATES, RUNNABLE_KINDS,
+} from '../src/validation.mjs';
 import { detectCapabilities, projectSpecTask, SPEC_SUITE_CAPABILITIES } from '../src/spec-suite.mjs';
 import { gitFreshness, inputsFreshness, decide, NEXT_ACTIONS, RECONCILE_STATUSES } from '../src/reconcile.mjs';
 import { collectMetrics } from '../src/metrics.mjs';
@@ -836,7 +838,7 @@ function validateCommand(args) {
       } else {
         selected = plan;
       }
-      const runnable = selected.filter((check) => check.kind === 'command');
+      const runnable = selected.filter((check) => RUNNABLE_KINDS.includes(check.kind));
       // Evidence names the commit it is evidence about. With modified tracked files in
       // the worktree, that name is false: the suite ran against something no commit
       // contains, and the record would look exactly like one that had. There is no

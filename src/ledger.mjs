@@ -30,7 +30,9 @@ import path from 'node:path';
 import { jsonDigest, inputSnapshotDigest, assertRevision } from './digest.mjs';
 import { isRole, roleIds } from './roles.mjs';
 import { assertId, slug, unslug, SlugError } from './slug.mjs';
-import { planProblems, checksRequiredAt, EVIDENCE_STATUSES, VALIDATION_GATES } from './validation.mjs';
+import {
+  planProblems, checksRequiredAt, EVIDENCE_STATUSES, VALIDATION_GATES, RUNNABLE_KINDS,
+} from './validation.mjs';
 
 export class LedgerError extends Error {
   constructor(code, message, details) {
@@ -1539,7 +1541,7 @@ export class Ledger {
             + 'Evidence must answer a check the packet actually asks for.',
           { taskId, checkId, declared: plan.map((entry) => entry.checkId) });
       }
-      if (check.kind !== 'command') {
+      if (!RUNNABLE_KINDS.includes(check.kind)) {
         throw new LedgerError('EVIDENCE_KIND_MISMATCH',
           `check ${checkId} is a ${check.kind} check, which is answered by a recorded review decision, `
             + 'not by evidence. Recording it here would put the same judgement in two places.',

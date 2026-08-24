@@ -2,10 +2,11 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/crazycola23/team-layer/schemas/validation-check.schema.json",
   "title": "Validation check",
-  "description": "One thing that must be true before a task can pass a gate (plan §6).\n\nA packet used to carry `validation: [\"npm test\"]` — a string nobody ran, checked against nothing, satisfied by remembering to. A check instead names itself (`checkId`), says how it is satisfied (`kind`), and says when it is required (`requiredAt`), which is what lets a gate ask a question with an answer.\n\nThe plan lives inside the frozen, digested half of the task packet. That is the load-bearing property: an Agent cannot add a check that passes, drop one that fails, or edit the command it is judged by without restating the task under a new generation, which is visible. It is also why executing a `command` check through a shell is safe at all — the string run is the one the packet author froze, not one the subject supplied.\n\nThe two kinds are deliberately one vocabulary rather than two mechanisms. A test run and a human judgement are both semantic evidence about one candidate, both go stale when the candidate or the inputs move, and a gate has to weigh them together (plan §7). A `review` check is answered by looking at review decisions (`reviewStateFor`), not by recording a second copy of the judgement as evidence.\n\nThe branches are closed objects rather than one open shape, so a `role` on a command check or a `timeoutMs` on a review check is refused instead of ignored. A field that is silently dropped is worse than a rejected one: the author believes they constrained something they did not.",
+  "description": "One thing that must be true before a task can pass a gate (plan §6).\n\nA packet used to carry `validation: [\"npm test\"]` — a string nobody ran, checked against nothing, satisfied by remembering to. A check instead names itself (`checkId`), says how it is satisfied (`kind`), and says when it is required (`requiredAt`), which is what lets a gate ask a question with an answer.\n\nThe plan lives inside the frozen, digested half of the task packet. That is the load-bearing property: an Agent cannot add a check that passes, drop one that fails, or edit the command it is judged by without restating the task under a new generation, which is visible. What freezing buys is integrity, not safety — it proves the command run is the one the author wrote, and a frozen `rm -rf` is still `rm -rf`. So `command` is structured `argv`, spawned without a shell: no word splitting, no globbing, no `&&`, no `$(...)`, and no quoting rules for an author to get wrong. A plan that genuinely needs shell syntax asks for it by name as `shell-command`, so the capability is legible in the frozen packet and in review instead of being handed to every check by default.\n\nThe kinds are deliberately one vocabulary rather than separate mechanisms. A test run and a human judgement are both semantic evidence about one candidate, both go stale when the candidate or the inputs move, and a gate has to weigh them together (plan §7). A `review` check is answered by looking at review decisions (`reviewStateFor`), not by recording a second copy of the judgement as evidence.\n\nThe branches are closed objects rather than one open shape, so a `role` on a command check, a `command` on an argv check, or a `timeoutMs` on a review check is refused instead of ignored. A field that is silently dropped is worse than a rejected one: the author believes they constrained something they did not.",
   "type": "object",
   "oneOf": [
     { "$ref": "#/$defs/commandCheck" },
+    { "$ref": "#/$defs/shellCommandCheck" },
     { "$ref": "#/$defs/reviewCheck" }
   ],
   "$defs": {
@@ -29,26 +30,47 @@
       "minLength": 1,
       "maxLength": 300
     },
+    "timeoutMs": {
+      "description": "How long the check gets before it is abandoned as `errored`. Omitted means the runner's default. A timeout is not a failure: nothing was learned about the candidate.",
+      "type": "integer",
+      "minimum": 1
+    },
     "commandCheck": {
-      "description": "Satisfied by running something and recording what happened.",
+      "description": "Satisfied by running a program and recording what happened. Spawned as argv with no shell, which is the default because it is the weaker capability: a check that only needs to run a test suite does not need word splitting, redirection or command substitution to do it.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["checkId", "kind", "requiredAt", "argv"],
+      "properties": {
+        "checkId": { "$ref": "#/$defs/checkId" },
+        "kind": { "$ref": "validation-kind.schema.json", "const": "command" },
+        "requiredAt": { "$ref": "#/$defs/requiredAt" },
+        "argv": {
+          "description": "The program and its arguments, already split into words: [\"npm\", \"test\", \"--\", \"coupon\"], not \"npm test -- coupon\". No shell parses this, so a word containing spaces or quotes arrives at the program exactly as written — which is the point, and also why `argv[0]` must be a program rather than a command line. On Windows a launcher such as npm or npx is a `.cmd` batch file that cannot be spawned without a shell; name the executable it wraps, or declare the check as `shell-command`.",
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": { "type": "string", "minLength": 1, "maxLength": 500 }
+        },
+        "timeoutMs": { "$ref": "#/$defs/timeoutMs" },
+        "description": { "$ref": "#/$defs/description" }
+      }
+    },
+    "shellCommandCheck": {
+      "description": "Satisfied the same way as a `command` check, but the line is handed to a shell — pipelines, `&&`, redirection and substitution all work. A separate kind rather than a flag on `command` so that the extra capability is a word a reviewer sees while reading the plan, not a boolean buried in a check body. Reach for it when the check genuinely is a shell line; for anything else `command` says more by being able to do less.",
       "type": "object",
       "additionalProperties": false,
       "required": ["checkId", "kind", "requiredAt", "command"],
       "properties": {
         "checkId": { "$ref": "#/$defs/checkId" },
-        "kind": { "$ref": "validation-kind.schema.json", "const": "command" },
+        "kind": { "$ref": "validation-kind.schema.json", "const": "shell-command" },
         "requiredAt": { "$ref": "#/$defs/requiredAt" },
         "command": {
-          "description": "The command line, run through the shell in the task's worktree. One string rather than argv because `npm test -- coupon` is what an author writes, and splitting it here would be a second, worse shell.",
+          "description": "The shell line, run in the task's worktree. One string rather than argv because a shell line is one string: splitting it into words here and reassembling it there would be a second, worse shell.",
           "type": "string",
           "minLength": 1,
           "maxLength": 500
         },
-        "timeoutMs": {
-          "description": "How long the check gets before it is abandoned as `errored`. Omitted means the runner's default. A timeout is not a failure: nothing was learned about the candidate.",
-          "type": "integer",
-          "minimum": 1
-        },
+        "timeoutMs": { "$ref": "#/$defs/timeoutMs" },
         "description": { "$ref": "#/$defs/description" }
       }
     },

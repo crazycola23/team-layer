@@ -594,9 +594,14 @@ test('the shipped review template records with only its ids filled in', () => {
     '--task', shipped.taskId, '--candidate', template.candidateRevision], g).stdout).unresolvedFindings, 1);
 });
 
-/** A check the fixture can actually run, without a package.json or a network. */
-function nodeCheck(script) {
-  return `"${process.execPath}" -e "${script}"`;
+/**
+ * A check the fixture can actually run, without a package.json or a network.
+ *
+ * argv rather than a line, which also retires the quoting this used to need: the script
+ * is one word no matter what punctuation is in it.
+ */
+function nodeArgv(script) {
+  return [process.execPath, '-e', script];
 }
 
 function validationPacket(overrides = {}) {
@@ -604,11 +609,11 @@ function validationPacket(overrides = {}) {
     validationPlan: [
       {
         checkId: 'unit-tests', kind: 'command', requiredAt: ['handoff', 'merge'],
-        command: nodeCheck(`console.log('unit tests green')`),
+        argv: nodeArgv(`console.log('unit tests green')`),
       },
       {
         checkId: 'contract-tests', kind: 'command', requiredAt: ['merge'],
-        command: nodeCheck(`console.error('AC-1 regressed'); process.exit(1)`),
+        argv: nodeArgv(`console.error('AC-1 regressed'); process.exit(1)`),
       },
       { checkId: 'peer-review', kind: 'review', requiredAt: ['merge'], role: 'reviewer' },
     ],
@@ -710,6 +715,41 @@ test('validate run records evidence, and the gate answer follows the candidate',
     ['unit-tests', 'passed', 'agent:fullstack-01'],
     ['contract-tests', 'failed', 'agent:fullstack-01'],
   ]);
+});
+
+/**
+ * The `shell-command` kind, end to end, because a kind that only the schema believes in
+ * is worse than one that does not exist.
+ *
+ * Two separate narrowings hide here and neither shows up in a plain `command` test: the
+ * runner's selection filter and the ledger's evidence guard. Either one reverting to
+ * `kind === 'command'` leaves a check that a packet may declare, that a gate then
+ * requires, and that `validate run` reports as covered having run nothing — or refuses
+ * to record after running. So the assertion is not "it ran" but "the gate it was
+ * required at now reads passed".
+ */
+test('a shell-command check is run and recorded, not quietly skipped', () => {
+  const f = bootstrapped({ agentId: 'fullstack-01', role: 'fullstack' });
+  run(['session', 'start', '--session', 'feature:coupon', '--target', 'main'], f);
+  // Two statements joined by `&&`: no argv can express this, which is the only reason
+  // the kind exists. `node` twice rather than a launcher — npm is a batch file.
+  const line = `"${process.execPath}" -e "console.log('first')" `
+    + `&& "${process.execPath}" -e "console.log('second')"`;
+  writePacket(f, validationPacket({
+    validationPlan: [
+      { checkId: 'contract-tests', kind: 'shell-command', requiredAt: ['merge'], command: line },
+    ],
+  }));
+  run(['task', 'issue', '--packet', 'packet.json'], f);
+  const args = ['--session', 'feature:coupon', '--task', 'task:coupon-api'];
+
+  const ran = JSON.parse(run(['validate', 'run', ...args, '--gate', 'merge'], f).stdout);
+  assert.deepEqual([ran.ran, ran.awaitingReview], [1, []], 'the check was selected, not filtered out');
+  assert.deepEqual([ran.evidence[0].checkId, ran.evidence[0].status], ['contract-tests', 'passed']);
+  // Both halves of the line ran, which is what proves a shell was actually involved
+  // rather than the first word having been spawned with the rest as arguments.
+  assert.match(ran.evidence[0].outputExcerpt, /first[\s\S]*second/);
+  assert.equal(JSON.parse(run(['validate', 'state', ...args, '--gate', 'merge'], f).stdout).status, 'passed');
 });
 
 /**
@@ -1074,8 +1114,8 @@ test('reconcile reads completed work against the merge gate, not the handoff gat
   run(['session', 'start', '--session', 'feature:coupon', '--target', branch], f);
   writePacket(f, taskPacket({
     validationPlan: [
-      { checkId: 'unit-tests', kind: 'command', requiredAt: ['handoff'], command: 'npm test' },
-      { checkId: 'contract-tests', kind: 'command', requiredAt: ['merge'], command: 'npm run contract' },
+      { checkId: 'unit-tests', kind: 'command', requiredAt: ['handoff'], argv: ['npm', 'test'] },
+      { checkId: 'contract-tests', kind: 'command', requiredAt: ['merge'], argv: ['npm', 'run', 'contract'] },
     ],
   }));
   run(['task', 'issue', '--packet', 'packet.json'], f);

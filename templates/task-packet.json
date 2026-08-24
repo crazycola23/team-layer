@@ -31,8 +31,12 @@
         "handoff",
         "merge"
       ],
-      "command": "npm test",
-      "description": "The suite must be green before this leaves the implementer's hands and again before it merges."
+      "argv": [
+        "node",
+        "--test",
+        "tests/"
+      ],
+      "description": "The suite must be green before this leaves the implementer's hands and again before it merges. argv rather than a shell line, and a real executable rather than a launcher: `npm` is a .cmd batch file on Windows and cannot be spawned without a shell."
     },
     {
       "checkId": "peer-review",

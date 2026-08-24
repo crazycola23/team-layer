@@ -88,7 +88,7 @@ export function taskPacket(overrides = {}) {
     inputs: [{ id: 'contract:coupon', revision: `sha256:${'1'.repeat(64)}`, authority: 'product-architect' }],
     acceptance: ['AC-1 discount applies at most once'],
     validationPlan: [
-      { checkId: 'unit-tests', kind: 'command', requiredAt: ['handoff', 'merge'], command: 'npm test' },
+      { checkId: 'unit-tests', kind: 'command', requiredAt: ['handoff', 'merge'], argv: ['node', '--test', 'tests/'] },
     ],
     ...overrides,
   };

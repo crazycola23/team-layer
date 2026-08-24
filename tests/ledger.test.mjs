@@ -64,7 +64,7 @@ function packet(overrides = {}) {
     inputs: [{ id: 'contract:coupon', revision: `sha256:${'1'.repeat(64)}`, authority: 'product-architect' }],
     acceptance: ['AC-1'],
     validationPlan: [
-      { checkId: 'unit-tests', kind: 'command', requiredAt: ['handoff', 'merge'], command: 'npm test' },
+      { checkId: 'unit-tests', kind: 'command', requiredAt: ['handoff', 'merge'], argv: ['node', '--test', 'tests/'] },
     ],
     ...overrides,
   };
@@ -1139,7 +1139,7 @@ function evidence(ledger, sessionId, over = {}) {
 function mixedPacket(overrides = {}) {
   return packet({
     validationPlan: [
-      { checkId: 'unit-tests', kind: 'command', requiredAt: ['handoff', 'merge'], command: 'npm test' },
+      { checkId: 'unit-tests', kind: 'command', requiredAt: ['handoff', 'merge'], argv: ['node', '--test', 'tests/'] },
       { checkId: 'peer-review', kind: 'review', requiredAt: ['merge'], role: 'reviewer' },
     ],
     ...overrides,
@@ -1201,7 +1201,8 @@ test('a task whose validation plan could not be run is refused at issue', () => 
     ['no plan at all', undefined],
     ['an empty plan', []],
     ['a command check with nothing to run', [{ checkId: 'unit-tests', kind: 'command', requiredAt: ['merge'] }]],
-    ['a gate nobody consults', [{ checkId: 'unit-tests', kind: 'command', requiredAt: ['vibe-check'], command: 'npm test' }]],
+    ['a command check smuggling a shell line', [{ checkId: 'unit-tests', kind: 'command', requiredAt: ['merge'], command: 'npm test' }]],
+    ['a gate nobody consults', [{ checkId: 'unit-tests', kind: 'command', requiredAt: ['vibe-check'], argv: ['npm', 'test'] }]],
     ['a review check naming a role nobody has', [{ checkId: 'peer', kind: 'review', requiredAt: ['merge'], role: 'vibe-officer' }]],
   ]) {
     assert.equal(code(() => ledger.issueTask({ sessionId, packet: packet({ validationPlan: plan }) })),
@@ -1246,6 +1247,33 @@ test('evidence must answer a check the packet actually declares, of a kind it ca
   assert.equal(evidence(ledger, sessionId, {
     result: result({ status: 'errored', exitCode: null, note: 'the check did not finish within 250ms' }),
   }).exitCode, null);
+});
+
+/**
+ * The mirror of the kind refusal above, and the half that rots quietly.
+ *
+ * A `shell-command` check is machine output too, so its run records like any other. A
+ * ledger that narrowed back to `command` alone would leave the shell kind declarable in
+ * a frozen packet, required at a gate, and unrecordable — a gate nothing could ever
+ * satisfy, discovered only after someone froze a packet around it.
+ */
+test('evidence is recordable for every runnable kind, not only for argv', () => {
+  const { ledger, sessionId } = startedSession();
+  ledger.issueTask({
+    sessionId,
+    packet: mixedPacket({
+      validationPlan: [{
+        checkId: 'contract-tests', kind: 'shell-command', requiredAt: ['merge'],
+        command: 'npm test && npm run contract',
+      }],
+    }),
+  });
+  const record = evidence(ledger, sessionId, { checkId: 'contract-tests' });
+  assert.deepEqual([record.status, validate(EVIDENCE_SCHEMA, record)], ['passed', []]);
+  // And it answers the gate it was required at — recorded but uncounted would be the
+  // same dead end reached one step later.
+  assert.equal(ledger.validationStateFor(sessionId, 'task:coupon',
+    { gate: 'merge', candidateRevision: 'git:def5678' }).status, 'passed');
 });
 
 /**

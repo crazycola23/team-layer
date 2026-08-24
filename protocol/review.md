@@ -12,10 +12,15 @@ acceptanceRevision: "..."
 canonicalInputs:
   - "contract:...@sha256:..."
 verificationRun:
-  - command: "..."
-    result: "passed"
+  - checkId: "unit-tests"
+    status: "passed"
 knownLimitations: []
 ```
+
+`verificationRun` names checks rather than command lines because a check id is what evidence is
+recorded under (`validate show`), and because the same id can be a program, a shell line or a
+required review. What the reviewer needs is which declared check was answered and how it came out;
+the words it ran are in the frozen packet, where nobody can restate them afterwards.
 
 ## First-pass review order
 

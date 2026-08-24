@@ -52,7 +52,7 @@ function packet(overrides = {}) {
     writeSet: ['src/coupon.ts'],
     inputs: [{ id: 'contract:checkout', revision: `sha256:${'c'.repeat(64)}`, authority: 'spec-suite' }],
     acceptance: ['a coupon over the cap is refused'],
-    validationPlan: [{ checkId: 'unit-tests', kind: 'command', requiredAt: ['merge'], command: 'npm test' }],
+    validationPlan: [{ checkId: 'unit-tests', kind: 'command', requiredAt: ['merge'], argv: ['node', '--test', 'tests/'] }],
     ...overrides,
   };
 }

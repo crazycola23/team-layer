@@ -10,9 +10,17 @@
  * 1. **The plan is frozen with the task.** It lives inside the digested half of
  *    the packet, so an Agent cannot add a check that passes, drop one that fails,
  *    or edit the command it is judged by. Changing the plan means restating the
- *    task under a new generation, which is visible. This is also why running a
- *    `command` check through the shell is safe to do at all: the string executed
- *    is the one the packet author wrote and froze, not one the subject supplied.
+ *    task under a new generation, which is visible.
+ *
+ *    What freezing buys is integrity, not safety. It proves the command run is the
+ *    one the author wrote; a frozen `rm -rf` is still `rm -rf`. So the default kind
+ *    is structured `argv` executed with `shell: false` — no word splitting, no
+ *    globbing, no `&&`, no `$(...)`, and no quoting rules for an author to get
+ *    wrong. A plan that genuinely needs shell syntax asks for it by name as
+ *    `kind: shell-command`, which is the whole point: the capability is legible in
+ *    the frozen packet and in review instead of being granted to every check by
+ *    default. The threat model stays cooperative-but-fallible — this is about not
+ *    handing out a capability nothing asked for, not about sandboxing malice.
  *
  * 2. **A check that could not run is not a check that failed.** `errored` is a
  *    separate outcome from `failed` because they route differently: a failure is
@@ -31,13 +39,21 @@ import { isRole, roleIds } from './roles.mjs';
 /**
  * What a check is.
  *
+ * `command` and `shell-command` are two kinds rather than one kind with a flag so
+ * that the difference is a word in the frozen packet. A reviewer scanning a plan
+ * sees which checks were handed a shell; a boolean buried in a check body is a
+ * field you have to remember to look at.
+ *
  * `review` is here rather than in a separate mechanism because plan §7 asks the
  * runner to "check reviewer decision applicability" as one step of a gate. A
  * human judgement and a test run are both semantic evidence about a candidate,
  * they go stale for the same reasons, and a gate has to weigh them together — so
  * they are the same kind of thing with different ways of being satisfied.
  */
-export const VALIDATION_KINDS = ['command', 'review'];
+export const VALIDATION_KINDS = ['command', 'shell-command', 'review'];
+
+/** The kinds satisfied by running something, and therefore by recorded evidence. */
+export const RUNNABLE_KINDS = ['command', 'shell-command'];
 
 /**
  * When a check is required.
@@ -109,11 +125,28 @@ export function planProblems(plan, label = 'validationPlan') {
         problems.push(`${at}.requiredAt repeats a gate`);
       }
     }
-    if (check.kind === 'command') {
-      if (typeof check.command !== 'string' || check.command.trim() === '') {
-        problems.push(`${at}.command must be a non-empty string for a command check`);
+    if (RUNNABLE_KINDS.includes(check.kind)) {
+      if (check.kind === 'command') {
+        if (!Array.isArray(check.argv) || check.argv.length === 0) {
+          problems.push(`${at}.argv must be a non-empty array of words for a command check: ["npm", "test"], not "npm test"`);
+        } else if (check.argv.some((word) => typeof word !== 'string' || word === '')) {
+          problems.push(`${at}.argv must contain only non-empty strings`);
+        }
+        // Refused rather than honoured, because honouring it is the whole hole: a
+        // packet that says `command` and means a shell line would get one silently.
+        if (check.command !== undefined) {
+          problems.push(`${at}.command does not apply to a command check; give argv instead, or declare `
+            + 'kind "shell-command" if this check genuinely needs shell syntax');
+        }
+      } else {
+        if (typeof check.command !== 'string' || check.command.trim() === '') {
+          problems.push(`${at}.command must be a non-empty string for a shell-command check`);
+        }
+        if (check.argv !== undefined) {
+          problems.push(`${at}.argv does not apply to a shell-command check; a shell line is one string`);
+        }
       }
-      if (check.role !== undefined) problems.push(`${at}.role does not apply to a command check`);
+      if (check.role !== undefined) problems.push(`${at}.role does not apply to a ${check.kind} check`);
       if (check.timeoutMs !== undefined
         && (!Number.isInteger(check.timeoutMs) || check.timeoutMs <= 0)) {
         problems.push(`${at}.timeoutMs must be a positive integer of milliseconds`);
@@ -128,10 +161,11 @@ export function planProblems(plan, label = 'validationPlan') {
         problems.push(`${at}.role must be one of ${roleIds().join(', ')} for a review check, got ${JSON.stringify(check.role)}`);
       }
       if (check.command !== undefined) problems.push(`${at}.command does not apply to a review check`);
+      if (check.argv !== undefined) problems.push(`${at}.argv does not apply to a review check`);
       if (check.timeoutMs !== undefined) problems.push(`${at}.timeoutMs does not apply to a review check`);
     }
     for (const key of Object.keys(check)) {
-      if (!['checkId', 'kind', 'requiredAt', 'command', 'role', 'timeoutMs', 'description'].includes(key)) {
+      if (!['checkId', 'kind', 'requiredAt', 'command', 'argv', 'role', 'timeoutMs', 'description'].includes(key)) {
         problems.push(`${at}.${key} is not part of a validation check`);
       }
     }
@@ -152,12 +186,11 @@ export function checksRequiredAt(plan, gate) {
 }
 
 /**
- * Run one `command` check and report what happened.
+ * Run one runnable check and report what happened.
  *
- * The command goes through the shell, because "npm test -- coupon" is what a
- * packet author writes and splitting it here would be a second, worse shell. See
- * the header for why that is not the hole it looks like: the string is frozen
- * inside the task's digest.
+ * A `command` check is spawned as argv with `shell: false`; a `shell-command` check
+ * is handed to the shell it asked for. See the header for why that is two kinds and
+ * not a flag.
  *
  * `resultDigest` covers the whole captured output, and the excerpt is its tail.
  * The tail rather than the head because a failing run puts the reason at the end,
@@ -167,6 +200,37 @@ export function checksRequiredAt(plan, gate) {
  * that runs can be compared.
  */
 /**
+ * A sentence naming the likely cause when a `command` check never started.
+ *
+ * Worth the special case because the two ways structured argv fails on a real
+ * machine are both invisible in the bare errno. A whole command line left in
+ * `argv[0]` fails as `ENOENT` on a binary named "npm test", and on Windows the
+ * launchers people reach for first — npm, npx, yarn — are `.cmd` batch files that
+ * Node will not spawn without a shell at all. Reported as "spawnSync npm ENOENT"
+ * and nothing else, both read as "the runner is broken", and the author goes
+ * looking in the wrong place.
+ */
+export function startupHint(check, code) {
+  if (check?.kind !== 'command') return '';
+  const argv0 = Array.isArray(check.argv) ? check.argv[0] : null;
+  if (typeof argv0 !== 'string' || argv0 === '') return '';
+  if (/\s/.test(argv0)) {
+    return ` argv[0] is ${JSON.stringify(argv0)}, which is a whole command line: argv has to be split into words.`;
+  }
+  const batch = /\.(?:cmd|bat)$/i.test(argv0);
+  if (code === 'EINVAL' && batch) {
+    return ` ${argv0} is a batch file, which cannot be spawned without a shell. Name the executable it`
+      + ' wraps, or declare this check as kind "shell-command".';
+  }
+  if (code === 'ENOENT' && process.platform === 'win32' && !batch) {
+    return ` On Windows a launcher such as npm, npx or yarn is a .cmd batch file rather than an`
+      + ' executable, and is not spawnable without a shell. Name the executable it wraps, or declare'
+      + ' this check as kind "shell-command".';
+  }
+  return '';
+}
+
+/**
  * Which of the three statuses a finished (or unfinished) run earned.
  *
  * Separate from `runCommandCheck` so it can be tested without arranging for the OS to
@@ -175,13 +239,13 @@ export function checksRequiredAt(plan, gate) {
  * would be the one classification nothing checks, and the invariant it protects —
  * unknown beats false — is precisely the one that fails silently when it breaks.
  */
-export function classifyRun(result, limit) {
+export function classifyRun(result, limit, check = null) {
   if (result.error) {
     return {
       status: 'errored',
       note: result.error.code === 'ETIMEDOUT'
         ? `the check did not finish within ${limit}ms`
-        : `the check could not be started: ${result.error.message}`,
+        : `the check could not be started: ${result.error.message}.${startupHint(check, result.error.code)}`,
     };
   }
   if (result.signal) {
@@ -194,19 +258,27 @@ export function classifyRun(result, limit) {
 }
 
 export function runCommandCheck(check, { cwd, env = process.env, timeoutMs } = {}) {
+  if (!RUNNABLE_KINDS.includes(check?.kind)) {
+    // A RangeError rather than an `errored` result: a review check reaching the runner
+    // is a caller bug, and returning evidence for it would file that bug as a fact
+    // about the candidate.
+    throw new RangeError(`runCommandCheck cannot run a ${JSON.stringify(check?.kind ?? null)} check; `
+      + `expected one of ${RUNNABLE_KINDS.join(', ')}`);
+  }
   const limit = timeoutMs ?? check.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const started = Date.now();
-  const result = spawnSync(check.command, {
-    cwd,
-    env,
-    shell: true,
-    encoding: 'utf8',
-    timeout: limit,
-    maxBuffer: 32 * 1024 * 1024,
-  });
+  const options = { cwd, env, encoding: 'utf8', timeout: limit, maxBuffer: 32 * 1024 * 1024 };
+  // Two calls rather than one with a computed `shell` flag, because `spawnSync(file,
+  // args, opts)` and `spawnSync(line, opts)` are different signatures. Passing argv
+  // *with* shell:true would concatenate the words back into a line without escaping
+  // them — Node's own DEP0190 warning — which is precisely the capability this kind
+  // exists to withhold.
+  const result = check.kind === 'shell-command'
+    ? spawnSync(check.command, { ...options, shell: true })
+    : spawnSync(check.argv[0], check.argv.slice(1), { ...options, shell: false });
   const output = `${result.stdout ?? ''}${result.stderr ?? ''}`;
   const durationMs = Date.now() - started;
-  const { status, note } = classifyRun(result, limit);
+  const { status, note } = classifyRun(result, limit, check);
   return {
     status,
     exitCode: result.status ?? null,
