@@ -3,24 +3,31 @@
  *
  * Two rules shape everything here.
  *
- * 1. **A capability is established by exercising it, never by reading about it.** The plan
- *    (§8) is explicit that "I read the docs and it seems supported" is not an answer, and
- *    the reason is not pedantry: spec-suite's task validator *silently accepts unknown
- *    fields*. Hand it an `inputs` array it has never heard of and nothing complains — the
- *    gate passes, the field is dropped, and the projection looks like it worked. Prose
- *    cannot catch that. Running the far side's own projection helper and looking at which
- *    keys survive can.
+ * 1. **A capability is established by asking the far side or by exercising it, never by reading
+ *    about it.** The plan (§8) is explicit that "I read the docs and it seems supported" is not an
+ *    answer, and the reason is not pedantry: spec-suite's task validator *silently accepts unknown
+ *    fields*. Hand it an `inputs` array it has never heard of and nothing complains — the gate
+ *    passes, the field is dropped, and the projection looks like it worked. Prose cannot catch that.
+ *
+ *    `scripts/capabilities.mjs` is not prose. It refuses to emit a feature whose implementation it
+ *    cannot find, and takes its whole response down rather than answer partially, so a declaration
+ *    that arrives has been checked against the checkout that produced it. That is why `declared`
+ *    outranks `probed` rather than merely being more convenient — and why the probe is now a
+ *    fallback for installs predating the handshake rather than the primary path.
  *
  * 2. **Unknown is not unsupported, and neither is supported.** Three values, for the same
  *    reason validation has three: "the mechanism is provably absent" and "I could not
  *    establish it" lead to different actions. Absent evidence degrades to `unknown`, and
  *    `unknown` never satisfies a projection — a field travels only on demonstrated support.
  *
- * The honest consequence is that a probe reports less than a handshake would. Once
- * spec-suite ships `scripts/capabilities.mjs` (plan §8, Phase A), `declared` supersedes all
- * of this and the versions become real numbers instead of `null`. Until then the probe is
- * what keeps the team layer from guessing, and `compatibilityMode` is where it says so out
- * loud rather than degrading quietly.
+ *    This applies to the handshake's own answers. A feature it does not mention is `unknown`,
+ *    because an older handshake has no way to say "definitely not"; a version that is not a
+ *    positive integer is also `unknown`, because a malformed answer is not an answer. Neither
+ *    becomes `unsupported` — that verdict belongs to the probe, which can see a module is absent.
+ *
+ * The honest consequence is that a probe reports less than a handshake would: no versions, and
+ * `unknown` for everything that needs a repository and a candidate to demonstrate.
+ * `compatibilityMode` is where that says so out loud rather than degrading quietly.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -138,11 +145,33 @@ function answer(support, evidence, version = null) {
 }
 
 /**
+ * A version, or nothing — and `0` is nothing.
+ *
+ * spec-suite's own suite refuses to emit a version that is not a positive integer, but that suite
+ * guards *that* checkout. This function is what stands between this layer and a fork, an older
+ * build, or a half-finished feature flag whose natural value is `0`. The hole it closes is narrow
+ * and quiet: `typeof 0 === 'number'`, so a `0` used to read as `supported` while meaning the
+ * opposite of support, and only a caller that *also* compared the version against a floor would
+ * have escaped it — which is to say, a caller doing the check this function exists to make
+ * unnecessary.
+ *
+ * A malformed version reads `unknown`, never `unsupported`: a handshake with a bug in one entry has
+ * established nothing about that feature, and its other entries are still the best information
+ * available. Quarantining the bad one and noting it beats discarding a real declaration over a
+ * fault that is visible and reportable.
+ */
+function versionOrNull(value) {
+  return Number.isInteger(value) && value > 0 ? value : null;
+}
+
+/**
  * Ask spec-suite what it supports, if it is in a position to be asked.
  *
- * `scripts/capabilities.mjs --format json` is the real handshake and is trusted whole,
- * including versions. Its absence is not a problem to route around silently: the return
- * value says `probed`, and every caller has to decide what to do with a `version: null`.
+ * `scripts/capabilities.mjs --format json` is the real handshake and is preferred whenever it
+ * answers, entry by entry: a well-formed version is taken at face value, a malformed one is
+ * quarantined as `unknown`, and the rest of the response still counts. Its absence is not a problem
+ * to route around silently: the return value says `probed`, and every caller has to decide what to
+ * do with a `version: null`.
  */
 export function detectCapabilities({ root, timeoutMs = 30_000 } = {}) {
   if (typeof root !== 'string' || root === '') {
@@ -188,22 +217,33 @@ function readDeclaredCapabilities(root, timeoutMs) {
     return probed;
   }
   const features = response.features ?? {};
+  const notes = [];
   const capabilities = Object.fromEntries(SPEC_SUITE_CAPABILITIES.map((name) => {
-    const version = features[name];
+    const declared = features[name];
     // A capability the handshake does not mention is unknown, not unsupported. The
     // handshake is allowed to grow, and an older one has no way to say "definitely not".
-    if (typeof version !== 'number') {
+    if (declared === undefined) {
       return [name, answer('unknown', 'the capability response does not mention it')];
+    }
+    const version = versionOrNull(declared);
+    if (version === null) {
+      // Not silently dropped: a doctor report that showed `unknown` with no reason would look
+      // like an old handshake, when what happened is that this one answered badly.
+      notes.push(`spec-suite declared ${name} as ${JSON.stringify(declared)}, which is not a version; treated as unknown`);
+      return [name, answer('unknown', `the capability response declares ${JSON.stringify(declared)}, which is not a version`)];
     }
     return [name, answer('supported', 'declared by scripts/capabilities.mjs', version)];
   }));
-  const notes = [];
   const extra = Object.keys(features).filter((name) => !SPEC_SUITE_CAPABILITIES.includes(name));
   if (extra.length) notes.push(`spec-suite declares capabilities this skill does not know about: ${extra.join(', ')}`);
+  const protocolVersion = versionOrNull(response.protocolVersion);
+  if (protocolVersion === null && response.protocolVersion !== undefined) {
+    notes.push(`spec-suite declared protocolVersion ${JSON.stringify(response.protocolVersion)}, which is not a version`);
+  }
   return {
     source: 'declared',
     root,
-    protocolVersion: typeof response.protocolVersion === 'number' ? response.protocolVersion : null,
+    protocolVersion,
     capabilities,
     projectableFields: discoverProjectableFields(root, notes),
     notes,

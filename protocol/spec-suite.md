@@ -36,11 +36,28 @@ compatible elsewhere but must not be presented as merge-gate-safe.
 
 ## Capability detection and compatibility mode
 
-There is no capability handshake to rely on: an installed spec-suite is a directory of scripts,
-not a service that answers questions about itself. So the interface is *detected*, and the
-detection is three-valued — `supported`, `unsupported`, `unknown` — because "we did not ask" and
-"we asked and it said no" call for different behaviour, and collapsing them is how a layer starts
-claiming knowledge it does not have.
+spec-suite answers questions about itself. `scripts/capabilities.mjs --format json` emits a
+`schemaVersion` / `protocolVersion` / `features` envelope in which every named feature carries a
+version, and it refuses to emit at all — exit 1, empty stdout — when a feature it would declare has
+an implementation it cannot find. So a declaration that arrives has been checked against the
+checkout that produced it, which is what makes it worth more than a file listing.
+
+Ask it first. Probing is the fallback for installs that predate the handshake, not a parallel
+source of truth: an experiment can discover what a function happens to keep, never which version of
+a guarantee it is keeping it under.
+
+Either way the answer is three-valued — `supported`, `unsupported`, `unknown` — because "we did not
+ask" and "we asked and it said no" call for different behaviour, and collapsing them is how a layer
+starts claiming knowledge it does not have. Two rules follow, and both are about not reading
+support into a non-answer:
+
+- A feature the handshake does not mention is **`unknown`**, not `unsupported`. An older handshake
+  has no way to say "definitely not" about something that did not exist when it was written.
+- A version that is not a positive integer is **`unknown`** too, and the reason is named in
+  `notes`. `0` is the natural value of a half-finished feature flag, and `typeof 0 === 'number'`,
+  so the obvious check would read it as support while it means the opposite.
+
+Only the probe returns `unsupported`, because only the probe can observe that a module is absent.
 
 Run it, and read the answer, with:
 
@@ -186,9 +203,13 @@ dependencies with revisions. Same word, unrelated meanings, and the projection i
 meet. This is a second reason `inputs` is withheld rather than passed through under an assumption
 that a same-named field means the same thing.
 
-**No handshake exists to settle either.** When `capabilitySource` is `probed` or `unavailable`,
-no capability versions are known and both layers' vocabularies are being matched up by this
-skill's reading of them. Prefer the explicit boundary over the convenient inference.
+**The handshake does not settle either, and cannot.** It reports which features exist and at what
+version; a version number says nothing about what a shared word means. `semanticInputs: 1` arriving
+one day would mean spec-suite's task contract carries semantic input revisions — it would not mean
+spec-suite's generator `inputs` had become the same field, and a projection that treated the
+declaration as permission to pass `inputs` through would be wrong in exactly the way the
+declaration was supposed to prevent. When `capabilitySource` is `probed` or `unavailable` even
+existence is unestablished. Either way, prefer the explicit boundary over the convenient inference.
 
 ## Testing across the boundary
 

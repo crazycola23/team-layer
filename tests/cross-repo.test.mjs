@@ -9,6 +9,10 @@
  *
  * So these run real spec-suite binaries against real Git repositories, in both directions —
  * projected task into spec-suite's gate, and spec-suite's verdict back into this layer's composer.
+ * The capability tests come first because they are what the other direction rests on: a projection
+ * decides what to carry from the far side's own answer about itself, so a handshake read from a hand-
+ * written JSON shape would only prove this file can read this file.
+ *
  * They skip, loudly, when no checkout is available; `scripts/validate-skill.mjs` refuses to let the
  * file or its tests disappear.
  */
@@ -19,6 +23,7 @@ import test from 'node:test';
 
 import { bootstrapped, run, taskPacket, writePacket, ROOT } from './helpers/cli.mjs';
 import { SPEC_SUITE_ENV, findSpecSuite, git, requireSpecSuite, specSuite } from './helpers/cross-repo.mjs';
+import { SPEC_SUITE_CAPABILITIES, detectCapabilities } from '../src/spec-suite.mjs';
 import { structuralVerdict } from '../src/integration.mjs';
 
 /**
@@ -59,6 +64,146 @@ function gate(root, { f, base, head, taskFile }, overrides = {}) {
   if (overrides.output) args.push('--output', overrides.output);
   return specSuite(root, 'merge-gate.mjs', args);
 }
+
+/**
+ * The handshake, read from the checkout that emits it.
+ *
+ * Every other capability test in this suite builds a fake `scripts/capabilities.mjs` and proves this
+ * layer can read it, which proves the reader and nothing about the contract: a fake emits the shape
+ * this layer expects by construction. The failure that costs something is a *name* drifting. If
+ * spec-suite renamed `mergeGate`, this layer would find no feature by that name, report `unknown`,
+ * withhold nothing it was carrying anyway, and go on returning `source: 'declared'` — a green suite,
+ * a real handshake, and every answer in it useless. Nothing fails; the layer just stops knowing
+ * things.
+ *
+ * So this reads spec-suite's own output and compares it entry for entry against what this layer made
+ * of it.
+ */
+test('cross-repo: the real handshake is read, and both layers name the same capabilities', (t) => {
+  const root = requireSpecSuite(t);
+  if (!root) return;
+  if (!fs.existsSync(path.join(root, 'scripts', 'capabilities.mjs'))) {
+    t.skip('this spec-suite predates scripts/capabilities.mjs, so the declared path cannot be run');
+    return;
+  }
+
+  const raw = specSuite(root, 'capabilities.mjs', ['--format', 'json']);
+  assert.equal(raw.status, 0, `the real handshake failed closed: ${raw.stderr}`);
+  assert.ok(raw.json, `the handshake emitted no JSON: ${raw.stdout}`);
+
+  const detection = detectCapabilities({ root });
+  assert.equal(detection.source, 'declared',
+    `the handshake is present but was not used; notes: ${detection.notes.join('; ')}`);
+  assert.equal(detection.protocolVersion, raw.json.protocolVersion);
+  assert.ok(Number.isInteger(detection.protocolVersion) && detection.protocolVersion > 0,
+    `protocolVersion must be a version, got ${detection.protocolVersion}`);
+
+  // The name check, in the direction that goes quiet: every feature spec-suite declares must be one
+  // this layer asks about. A name this layer does not know is dropped on the floor, and the only
+  // trace is a note nobody has to read — so the note is asserted absent rather than logged.
+  const unknownNames = Object.keys(raw.json.features)
+    .filter((name) => !SPEC_SUITE_CAPABILITIES.includes(name));
+  assert.deepEqual(unknownNames, [],
+    'spec-suite declares capabilities this layer has no name for; add them to SPEC_SUITE_CAPABILITIES '
+    + 'or they are silently discarded');
+  assert.equal(detection.notes.some((note) => /does not know about/.test(note)), false,
+    `detection reported unknown capability names: ${detection.notes.join('; ')}`);
+
+  // And every declared feature arrived with its version intact. Reading the version wrong is worse
+  // than not reading it: a caller pinning `mergeGate >= 2` would be pinning a number this layer
+  // invented.
+  for (const [name, version] of Object.entries(raw.json.features)) {
+    const answer = detection.capabilities[name];
+    assert.equal(answer.support, 'supported', `${name} is declared but read as ${answer.support}`);
+    assert.equal(answer.version, version, `${name}: spec-suite says ${version}, this layer read ${answer.version}`);
+  }
+
+  // The composition this layer depends on, tied to the number that promises it. `structuralVerdict`
+  // can only bind a verdict to a task because the gate refuses a task with no `taskId` — which is
+  // half of what `mergeGate: 2` means. Pinning the floor here means a spec-suite that regressed to
+  // version 1 would be a red test rather than a composer quietly comparing `undefined` to `undefined`.
+  assert.ok(detection.capabilities.mergeGate.version >= 2,
+    `this layer composes against mergeGate >= 2; the install declares ${detection.capabilities.mergeGate.version}`);
+});
+
+/**
+ * What the real handshake stays silent about, and why silence must not read as support.
+ *
+ * Today spec-suite declares three features and deliberately omits `semanticInputs` and
+ * `semanticValidator` — its own suite holds those omissions to the shapes that justify them. This is
+ * the consuming half: an omission has to arrive here as `unknown`, never `supported`, or the
+ * projection would hand `inputs` to a task contract that has no such field and the merge gate would
+ * appear to be enforcing staleness that nothing enforces.
+ *
+ * It must not arrive as `unsupported` either, and that costs something worth naming. The probe used
+ * to answer `unsupported` for `semanticInputs`, having watched the far side's projection drop the
+ * field — a stronger finding than the handshake's silence. Installing the handshake therefore
+ * *weakens* this one answer, and that is the correct trade: the probe's finding came from inferring
+ * a property of the task contract from a scheduling helper, which is the exact move that produced
+ * the `taskId` bug. Both answers withhold the field; only one of them claims to know why.
+ */
+test('cross-repo: a feature the real handshake omits reads as unknown, not supported', (t) => {
+  const root = requireSpecSuite(t);
+  if (!root) return;
+  if (!fs.existsSync(path.join(root, 'scripts', 'capabilities.mjs'))) {
+    t.skip('this spec-suite predates scripts/capabilities.mjs, so the declared path cannot be run');
+    return;
+  }
+
+  const raw = specSuite(root, 'capabilities.mjs', ['--format', 'json']);
+  const detection = detectCapabilities({ root });
+  const omitted = SPEC_SUITE_CAPABILITIES
+    .filter((name) => !Object.prototype.hasOwnProperty.call(raw.json.features, name));
+  assert.ok(omitted.length > 0,
+    'the install declares every capability this layer knows; this test can no longer distinguish '
+    + 'silence from support and needs a new subject');
+
+  for (const name of omitted) {
+    assert.equal(detection.capabilities[name].support, 'unknown',
+      `${name} is not declared, so it must be unknown, not ${detection.capabilities[name].support}`);
+    assert.equal(detection.capabilities[name].version, null);
+  }
+});
+
+/**
+ * Detection reaching the artifact: the projection an Agent actually gets, against the real far side.
+ *
+ * The two tests above establish what the handshake says. This one establishes that saying it changes
+ * what travels — the whole reason the handshake was worth building. A detection layer that reported
+ * beautifully and projected identically either way would be decoration.
+ */
+test('cross-repo: a real declared handshake is what the projection report acts on', (t) => {
+  const root = requireSpecSuite(t);
+  if (!root) return;
+  if (!fs.existsSync(path.join(root, 'scripts', 'capabilities.mjs'))) {
+    t.skip('this spec-suite predates scripts/capabilities.mjs, so the declared path cannot be run');
+    return;
+  }
+  const { report } = projected(root);
+
+  assert.equal(report.compatibility.source, 'declared');
+  assert.equal(report.compatibility.fieldsDiscovered, true,
+    'the projectable field list must still be discovered from the far side, not assumed');
+  assert.equal(report.compatibility.warnings.some((w) => /no capability handshake was available/.test(w)),
+    false, 'a handshake answered; the report must not still be apologising for its absence');
+
+  // `inputs` stays behind, and the report says which capability held it back. Degraded is the honest
+  // status here: the field is enforced, but only in this layer, and a caller is entitled to refuse
+  // to proceed on that rather than discover it in a log.
+  assert.equal(report.compatibility.mode, 'degraded');
+  const inputs = report.withheld.find((w) => w.field === 'inputs');
+  assert.ok(inputs, `inputs must be reported as withheld: ${JSON.stringify(report.withheld)}`);
+  assert.equal(inputs.reason, 'capability-unknown',
+    'the handshake is silent about semanticInputs, so the reason is unknown rather than unsupported');
+  assert.equal(inputs.capability, 'semanticInputs');
+  assert.equal(report.projected.includes('inputs'), false,
+    'a field withheld for a capability reason must not also be reported as carried');
+
+  // And the fields the handshake's declared capabilities do license are all there, `taskId` included
+  // — the one that travels whatever detection says.
+  assert.deepEqual(report.projected,
+    ['baseRevision', 'readSet', 'role', 'subject', 'taskId', 'writeSet']);
+});
 
 /**
  * The test P0-1 exists for: the artifact this layer writes is one the real gate can read.

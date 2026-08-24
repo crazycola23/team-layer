@@ -171,7 +171,7 @@ test('a far side that cannot be exercised falls back to an assumed list, and say
   }
 });
 
-/** The handshake, once spec-suite ships one (plan §8), supersedes every probe. */
+/** The handshake supersedes every probe: the far side is the authority on itself. */
 test('a declared handshake is trusted whole, versions included', () => {
   const root = install({
     capabilities: 'process.stdout.write(JSON.stringify({ schemaVersion: 1, protocolVersion: 3,'
@@ -200,6 +200,63 @@ test('a handshake that omits a capability leaves it unknown rather than unsuppor
   // An older handshake has no way to say "definitely not", so absence cannot mean absence.
   assert.equal(detection.capabilities.semanticInputs.support, 'unknown');
   assert.match(detection.capabilities.semanticInputs.evidence, /does not mention it/);
+});
+
+/**
+ * A version that is not a positive integer is not an answer, and the fake is the only way to say so.
+ *
+ * The real `scripts/capabilities.mjs` refuses to emit a version it cannot verify, so no real
+ * checkout produces this response and `tests/cross-repo.test.mjs` can never exercise the branch.
+ * That is exactly why the branch exists: it stands between this layer and a fork, a half-finished
+ * build, or a hand-edited handshake, none of which are bound by spec-suite's own suite.
+ *
+ * `0` is the case worth naming. It is the natural value of a feature flag someone has begun and not
+ * finished, `typeof 0 === 'number'`, and the obvious check reads it as support — the opposite of
+ * what it means. Every one of these reads `unknown` rather than `unsupported`, because only the
+ * probe can observe that a module is absent; a handshake answering badly has told us nothing.
+ */
+test('a version that is not a positive integer reads as unknown, with the reason named', () => {
+  for (const [json, shown] of [
+    ['0', '0'],
+    ['1.5', '1.5'],
+    ['-2', '-2'],
+    ['"2"', '"2"'],
+    ['true', 'true'],
+    ['null', 'null'],
+  ]) {
+    const root = install({
+      capabilities: 'process.stdout.write(JSON.stringify({ schemaVersion: 1, protocolVersion: 1,'
+        + ` features: { mergeGate: ${json}, multiAgentConcurrency: 1 } }));\n`,
+    });
+    const detection = detectCapabilities({ root });
+    assert.equal(detection.source, 'declared', json);
+    assert.deepEqual(detection.capabilities.mergeGate, {
+      support: 'unknown',
+      version: null,
+      evidence: `the capability response declares ${shown}, which is not a version`,
+    }, json);
+    assert.ok(detection.notes.some((n) => n.includes(`declared mergeGate as ${shown}`)),
+      `${json}: a report showing unknown with no reason looks like an old handshake, `
+      + 'when what happened is that this one answered badly');
+    // Quarantine is per entry. Discarding the whole response would throw away answers that were
+    // fine, and hand the caller a worse picture than the malformed handshake actually justifies.
+    assert.deepEqual(detection.capabilities.multiAgentConcurrency, {
+      support: 'supported', version: 1, evidence: 'declared by scripts/capabilities.mjs',
+    }, json);
+  }
+});
+
+test('a malformed protocolVersion is refused the same way, and said out loud', () => {
+  const root = install({
+    capabilities: 'process.stdout.write(JSON.stringify({ schemaVersion: 1, protocolVersion: 0,'
+      + ' features: { mergeGate: 2 } }));\n',
+  });
+  const detection = detectCapabilities({ root });
+  // The envelope version decides whether the two sides are speaking the same protocol at all, so
+  // reading `0` as a real version here would be the widest-reaching version of the same mistake.
+  assert.equal(detection.protocolVersion, null);
+  assert.ok(detection.notes.some((n) => /protocolVersion 0, which is not a version/.test(n)));
+  assert.equal(detection.capabilities.mergeGate.support, 'supported');
 });
 
 /**

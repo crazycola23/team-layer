@@ -773,6 +773,11 @@ if (fs.existsSync(path.join(ROOT, CI_WORKFLOW))) {
  * So: the named tests must be present, and the file must reach for `requireSpecSuite` — the helper
  * whose only job is to record a `skip` with the variable to set — rather than deciding for itself
  * what to do when there is no checkout.
+ *
+ * The handshake test is named here for the same reason as the merge-gate ones. Capability detection
+ * has a fallback, so deleting the test that runs spec-suite's real `scripts/capabilities.mjs` costs
+ * nothing visible: detection quietly reverts to probing, every faked-handshake test still passes,
+ * and this layer goes back to inferring guarantees from which files happen to exist.
  */
 const CROSS_REPO = 'tests/cross-repo.test.mjs';
 ok(fs.existsSync(path.join(ROOT, CROSS_REPO)),
@@ -780,13 +785,14 @@ ok(fs.existsSync(path.join(ROOT, CROSS_REPO)),
 if (fs.existsSync(path.join(ROOT, CROSS_REPO))) {
   const crossRepo = text(CROSS_REPO);
   const names = [...crossRepo.matchAll(/^test\('(cross-repo: [^']*)'/gm)].map((m) => m[1]);
-  ok(names.length >= 5,
-    `${CROSS_REPO} must keep at least five cross-repo tests, found ${names.length}: `
+  ok(names.length >= 8,
+    `${CROSS_REPO} must keep at least eight cross-repo tests, found ${names.length}: `
     + `[${names.join('; ')}]`);
   for (const [claim, pattern] of [
     ['a projected task is read by the real merge gate', /real merge gate reads a projected task/],
     ['spec-suite, not this layer, is what requires taskId', /makes taskId non-negotiable/],
     ["a real verdict is legible to this layer's composer", /legible to structuralVerdict/],
+    ["the real handshake is what capability detection reads", /real handshake is read/],
   ]) {
     ok(names.some((name) => pattern.test(name)),
       `${CROSS_REPO} must still prove that ${claim}; its tests are [${names.join('; ')}]`);
