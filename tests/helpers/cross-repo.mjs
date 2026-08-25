@@ -15,6 +15,7 @@
  * a red line.
  */
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { ROOT } from './cli.mjs';
@@ -65,6 +66,33 @@ export function findSpecSuite(env = process.env) {
     + `(searched siblings: ${SIBLINGS.join(', ')})` };
 }
 
+/**
+ * A checkout of the sibling's *committed* HEAD, made once per test process.
+ *
+ * The sibling is this layer's own probe fixture, not an operator's choice, and what it holds on
+ * disk is whatever the last session over there was in the middle of. That is not the contract:
+ * these tests assert what the far side has committed, and a half-finished session leaving
+ * `capabilities.mjs` modified in its worktree once turned every handshake assertion red for a
+ * reason no commit introduced — while the sibling's uncommitted work was exactly the thing
+ * nobody had agreed to yet. Cloning gives the tests the committed state without touching the
+ * sibling's working tree, so the WIP stays exactly as its author left it and the suite stays
+ * green for reasons a commit can explain.
+ *
+ * The env-var path deliberately does no such thing: an operator who exported
+ * `TEAM_LAYER_SPEC_SUITE_ROOT` asked for *that* directory, dirt and all.
+ */
+let committedSibling = null;
+function committedCheckout(root) {
+  if (committedSibling) return committedSibling;
+  // A sibling without a `.git` is an unpacked export: it has no committed state to be faithful
+  // to, so it is used as-is rather than refused.
+  if (!fs.existsSync(path.join(root, '.git'))) return root;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'team-layer-spec-suite-'));
+  execFileSync('git', ['clone', '--quiet', root, dir], { encoding: 'utf8' });
+  committedSibling = dir;
+  return committedSibling;
+}
+
 /** The root, or null after marking the test skipped with the reason. */
 export function requireSpecSuite(t, env = process.env) {
   const found = findSpecSuite(env);
@@ -72,7 +100,7 @@ export function requireSpecSuite(t, env = process.env) {
     t.skip(found.reason);
     return null;
   }
-  return found.root;
+  return found.source === 'sibling' ? committedCheckout(found.root) : found.root;
 }
 
 /**
