@@ -45,9 +45,38 @@ Task     = what it is doing now             (temporary)
 Context  = volatile working memory          (disposable)
 ```
 
+## Identity activation
+
+An unbound window is **ephemeral by default**. The skill does not force a permanent role merely
+because it is installed or because a task is difficult.
+
+When a responsibility has real continuity value across future sessions/context loss, classify its
+primary ownership and ask the activation advisor:
+
+```bash
+node scripts/activation.mjs --continuity persistent --work implementation
+```
+
+The decision surface is deliberately small:
+
+```text
+resume-existing-identity
+stay-ephemeral
+suggest-product-architect
+suggest-fullstack
+suggest-reviewer
+```
+
+The advisor never creates or changes identity. If it recommends a role, the Agent proposes that one
+role to the user; only an accepted recommendation is claimed with `teamctl setup`. Once a worktree
+is bound, activation never reclassifies it — restarts, compaction and new prompts resume the same
+identity. See [protocol/activation.md](protocol/activation.md).
+
 ## Quick start
 
-Create three worktrees as you normally would, then run one setup command in each.
+For a manually chosen identity, create three worktrees as you normally would, then run one setup
+command in each. The same `setup` command is also the final step after the user accepts an activation
+recommendation.
 
 ### Product Architect on Claude Code
 
@@ -127,6 +156,10 @@ tracked `.gitignore`.
 It does not launch Agents, create cloud resources, decide model choice, rewrite shared
 project instructions, implement a second merge gate, or grant capabilities. It keeps durable
 state and answers questions about it; every judgment call stays with the Agent or the user.
+
+The activation advisor is intentionally narrower still: it does not parse prompts, write bindings,
+or reassign roles. The Agent supplies semantic observations; the advisor makes the persistence
+boundary deterministic.
 
 ## spec-suite
 

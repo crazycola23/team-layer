@@ -40,6 +40,7 @@ handoffs, recovery, and the team protocol between them.
 6. **Code is candidate state until validated.** A commit is not “done” merely because an Agent says it is done.
 7. **Recovery beats memory.** After restart/compaction, reconstruct state from identity, task/session artifacts, canonical inputs, and Git — start with `teamctl reconcile`, which does it from the ledger rather than from what you recall.
 8. **Coordination must earn its cost.** Solo work stays solo. Team mode is for work with real cross-role value.
+9. **Persistence must earn its cost.** An unbound window stays ephemeral until long-term continuity has real value; a suggested identity is never silently claimed.
 
 Short form:
 
@@ -48,19 +49,61 @@ Identity must not depend on harness.
 Role must not depend on model.
 Project truth must not depend on conversation.
 Task state must not depend on context window.
+Durable identity must not be created from a guess.
 ```
 
-## 2. First use: claim, then bind
+## 2. First use: activate, then claim and bind
 
-Do not guess a persistent role.
+An unbound window is **ephemeral by default**. Do not force the user to choose a permanent role merely
+because this skill is installed, and do not treat task size or difficulty by itself as evidence that a
+persistent identity is useful.
 
 On first use in a worktree, look for `.agent-team-binding.json`.
 
-- If it exists, use its `agentId` to load the durable identity and continue.
-- If it does not exist and the user has already named the role/identity, claim that identity.
-- If the user has not named a role, present only the three supported roles and ask which one this window should permanently claim.
+- If it exists, use its `agentId` to load the durable identity and continue. **Do not classify the prompt again.** A new task that resembles another role is not permission to switch identity.
+- If it does not exist and the user has already explicitly named the durable role/identity, claim that identity with `setup`.
+- Otherwise, decide whether the **responsibility** has meaningful continuity value beyond this conversation. If not, remain ephemeral and do the work normally.
+- If continuity value is real, recommend exactly one role only when primary ownership is clear. If ownership is mixed/unknown, remain ephemeral rather than guessing a durable role.
+- A recommendation is not a claim. Ask for a lightweight user confirmation before running `setup`.
 
-Preferred helper:
+Preferred advisory helper:
+
+```bash
+node scripts/activation.mjs \
+  --continuity persistent \
+  --work implementation
+```
+
+Its decision surface is intentionally small:
+
+```text
+resume-existing-identity
+stay-ephemeral
+suggest-product-architect
+suggest-fullstack
+suggest-reviewer
+```
+
+The helper is read-only: it never creates identity, changes a binding, or reassigns a role. The Agent
+supplies semantic observations; the helper applies the irreversible boundary consistently.
+
+Use these ownership categories:
+
+- `product` → Product Architect: WHAT/WHY, acceptance, shared contracts/system boundaries.
+- `implementation` → Fullstack: implementation HOW, code, tests, fixes, candidate commits.
+- `review` → Reviewer: independent verification of an existing candidate/diff/PR.
+- `mixed` / `unknown` → do not guess a permanent role.
+
+Treat continuity as persistent when the responsibility itself should survive context compaction,
+restarts, future sessions, or model/harness changes; when later work must recover this role's progress;
+when other Agents will address it in the same capacity; or when the user assigns ongoing ownership.
+A difficult one-shot task can remain ephemeral.
+
+When one role is clearly indicated, recommend it directly instead of presenting a generic three-role
+questionnaire. Example: “This looks like ongoing implementation ownership that should survive future
+context loss. I recommend binding this worktree as Fullstack. Claim that identity?”
+
+After the user accepts, claim with the existing helper:
 
 ```bash
 node scripts/teamctl.mjs setup \
@@ -78,8 +121,9 @@ Never put individual Agent identity into a tracked project-wide `CLAUDE.md`, `AG
 or `GEMINI.md`. Three worktrees with three identities must not create a Git merge conflict
 about who they are.
 
-Read [protocol/identity.md](protocol/identity.md) for the durable data model and
-[adapters/](adapters/) for harness-specific bootstrap choices.
+Read [protocol/activation.md](protocol/activation.md) for the activation threshold and UX,
+[protocol/identity.md](protocol/identity.md) for the durable data model, and [adapters/](adapters/)
+for harness-specific bootstrap choices.
 
 ## 3. Every start/resume: deterministic recovery
 
@@ -138,6 +182,10 @@ Use **team mode** when at least two of these are true:
 - the repository already mandates spec-suite multi-agent governance.
 
 Do not auto-summon all three Agents for a typo, mechanical refactor, or tiny local bug.
+
+Identity activation and team mode are separate decisions. A persistent Fullstack may perform many
+solo tasks; claiming an identity does not summon the other roles. Conversely, team mode does not
+permit silent identity creation — every persistent participant must be explicitly claimed/bound.
 
 ## 5. Role router
 
@@ -342,7 +390,9 @@ A successful team run minimizes **human traffic-cop work**. Measure the system b
 - false blocks / unnecessary revalidation;
 - review findings that escaped implementation self-check;
 - post-merge integration failures;
-- context-recovery success without asking the user to restate prior work.
+- context-recovery success without asking the user to restate prior work;
+- activation false positives: identities claimed that should have remained ephemeral;
+- activation false negatives: repeated work that later required a durable claim.
 
 If the protocol creates more ceremony without reducing intervention or escaped errors,
 simplify it. Internal machinery is allowed to be sophisticated; the Agent-facing decision
